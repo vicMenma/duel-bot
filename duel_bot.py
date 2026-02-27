@@ -25,10 +25,10 @@ from telegram.ext import (
 )
 
 # ─────────────────────────────────────────────
-#  CONFIG — Modifiez ces valeurs
+#  CONFIG — Variables d'environnement Render
 # ─────────────────────────────────────────────
-BOT_TOKEN       = "VOTRE_BOT_TOKEN_ICI"
-MAIN_GROUP_ID   = -1001234567890
+BOT_TOKEN       = os.environ.get("BOT_TOKEN")
+MAIN_GROUP_ID   = int(os.environ.get("MAIN_GROUP_ID", "0"))
 DATA_FILE       = "duel_data.json"
 DUEL_TIMEOUT    = 300                   # 5 min pour poster après début du duel
 ACCEPT_TIMEOUT  = 300                   # 5 min pour accepter l'invitation
