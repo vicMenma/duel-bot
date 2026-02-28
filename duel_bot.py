@@ -1171,6 +1171,17 @@ async def cmd_resetpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 
 def main():
+    # Vérifications au démarrage
+    if not BOT_TOKEN:
+        logger.critical("❌ BOT_TOKEN manquant ! Ajoute la variable d'environnement BOT_TOKEN sur Koyeb.")
+        exit(1)
+    if MAIN_GROUP_ID == 0:
+        logger.critical("❌ MAIN_GROUP_ID manquant ! Ajoute la variable d'environnement MAIN_GROUP_ID sur Koyeb.")
+        exit(1)
+
+    logger.info(f"✅ BOT_TOKEN détecté")
+    logger.info(f"✅ MAIN_GROUP_ID = {MAIN_GROUP_ID}")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start",        cmd_start))
@@ -1260,6 +1271,17 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 
 def main():
+    # Vérifications au démarrage
+    if not BOT_TOKEN:
+        logger.critical("❌ BOT_TOKEN manquant ! Ajoute la variable d'environnement BOT_TOKEN sur Koyeb.")
+        exit(1)
+    if MAIN_GROUP_ID == 0:
+        logger.critical("❌ MAIN_GROUP_ID manquant ! Ajoute la variable d'environnement MAIN_GROUP_ID sur Koyeb.")
+        exit(1)
+
+    logger.info(f"✅ BOT_TOKEN détecté")
+    logger.info(f"✅ MAIN_GROUP_ID = {MAIN_GROUP_ID}")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start",        cmd_start))
