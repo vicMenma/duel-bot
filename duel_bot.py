@@ -861,9 +861,16 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if video_size == 0:
         return
 
-    logger.info(f"Video detected in chat {chat_id}, size={video_size}")
+    logger.info(f"📹 Vidéo reçue — chat_id={chat_id}, size={video_size}, update_type={'channel_post' if update.channel_post else 'message'}")
 
     data = load_data()
+
+    # Log tous les duels actifs pour comparaison
+    active_duels = [(k, d) for k, d in data.get("duels", {}).items() if d["status"] == "active"]
+    logger.info(f"⚔️ Duels actifs : {len(active_duels)}")
+    for k, d in active_duels:
+        logger.info(f"   Duel {k}: canal_A={d.get('challenger_channel')} canal_B={d.get('challenged_channel')}")
+        logger.info(f"   Ce chat ({chat_id}) correspond ? A={chat_id == d.get('challenger_channel')} B={chat_id == d.get('challenged_channel')}")
 
     for duel_key, duel in list(data.get("duels", {}).items()):
         if duel["status"] != "active":
@@ -918,14 +925,14 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(
                     MAIN_GROUP_ID,
-                    f"⚠️ *Petite vidéo détectée \\!*\n\n"
-                    f"👤 @{esc(poster_name)}\n"
-                    f"📺 Canal : *{esc(chat_title)}*\n"
-                    f"📦 Taille : *{esc(f'{size_mb:.2f}')} Mo* \\(minimum requis : 70 Mo\\)\n"
-                    f"🕐 Heure : `{esc(post_time_str)}`\n\n"
-                    f"💸 *\\-3 points* pour @{esc(poster_name)}\n"
-                    f"⚡ Il peut encore poster une vidéo ≥ 70 Mo avant @{esc(opponent_name)} pour gagner *\\+6 pts* \\!",
-                    parse_mode="MarkdownV2"
+                    f"⚠️ <b>Petite vidéo détectée !</b>\n\n"
+                    f"👤 @{h(poster_name)}\n"
+                    f"📺 Canal : <b>{h(chat_title)}</b>\n"
+                    f"📦 Taille : <b>{size_mb:.2f} Mo</b> (minimum : 70 Mo)\n"
+                    f"🕐 Heure : <code>{h(post_time_str)}</code>\n\n"
+                    f"💸 <b>-3 points</b> pour @{h(poster_name)}\n"
+                    f"⚡ Il peut encore poster une vidéo ≥ 70 Mo avant @{h(opponent_name)} pour gagner <b>+6 pts</b> !",
+                    parse_mode="HTML"
                 )
             except Exception as e:
                 logger.error(f"Erreur pénalité: {e}")
@@ -936,27 +943,27 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             points_won  = 6 if had_penalty else 3
             points_lost = -1
 
-            # Calcul du chrono depuis le début du duel
+            # Chrono depuis le début du duel
             duel_start   = duel.get("started_at", now_ts)
             elapsed      = int(now_ts - duel_start)
             elapsed_min  = elapsed // 60
             elapsed_sec  = elapsed % 60
 
             # Infos sur la vidéo du perdant si elle existe
-            loser_video  = duel.get("video_timestamps", {}).get(str(opponent_id))
-            loser_info   = ""
+            loser_video = duel.get("video_timestamps", {}).get(str(opponent_id))
+            loser_info  = ""
             if loser_video:
-                loser_dt  = datetime.fromtimestamp(loser_video["ts"])
-                loser_str = loser_dt.strftime("%d/%m/%Y à %H:%M:%S")
-                gap       = int(now_ts - loser_video["ts"])
-                gap_min   = gap // 60
-                gap_sec   = gap % 60
+                loser_dt       = datetime.fromtimestamp(loser_video["ts"])
+                loser_str      = loser_dt.strftime("%d/%m/%Y à %H:%M:%S")
                 loser_size_str = f"{loser_video['size_mb']:.2f}"
+                gap            = int(now_ts - loser_video["ts"])
+                gap_min        = gap // 60
+                gap_sec        = gap % 60
                 loser_info = (
-                    f"\n\n📋 *Vidéo de @{esc(opponent_name)} :*\n"
-                    f"  🕐 Heure : `{esc(loser_str)}`\n"
-                    f"  📦 Taille : *{esc(loser_size_str)} Mo*\n"
-                    f"  ⏳ Retard : *{esc(gap_min)}min {gap_sec:02d}s* après le vainqueur"
+                    f"\n\n📋 <b>Vidéo de @{h(opponent_name)} :</b>\n"
+                    f"  🕐 Heure : <code>{h(loser_str)}</code>\n"
+                    f"  📦 Taille : <b>{loser_size_str} Mo</b>\n"
+                    f"  ⏳ Retard : <b>{gap_min}min {gap_sec:02d}s</b> après le vainqueur"
                 )
 
             get_player(data, poster_id, poster_name)
@@ -983,31 +990,31 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del data["duels"][duel_key]
             save_data(data)
 
-            bonus_txt = "\n🔥 *Bonus rattrapage \\!* \\(pénalité petite vidéo compensée\\)" if had_penalty else ""
+            bonus_txt = "\n🔥 <b>Bonus rattrapage !</b> (pénalité petite vidéo compensée)" if had_penalty else ""
 
             victory_msg = (
-                f"🏆 *DUEL TERMINÉ — VICTOIRE \\!*\n"
-                f"{'━' * 28}\n\n"
-                f"⚔️ @{esc(duel['challenger_name'])} 🆚 @{esc(duel['challenged_name'])}\n\n"
-                f"🥇 *VAINQUEUR : @{esc(poster_name)}*{bonus_txt}\n\n"
-                f"{'━' * 28}\n"
-                f"📋 *Preuve de victoire :*\n\n"
-                f"  👤 Vainqueur : @{esc(poster_name)}\n"
-                f"  📺 Canal : *{esc(chat_title)}*\n"
-                f"  📦 Taille vidéo : *{esc(f'{size_mb:.2f}')} Mo*\n"
-                f"  🕐 Heure de publication : `{esc(post_time_str)}`\n"
-                f"  ⏱️ Temps écoulé depuis le début : *{esc(elapsed_min)}min {elapsed_sec:02d}s*"
+                f"🏆 <b>DUEL TERMINÉ — VICTOIRE !</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"⚔️ @{h(duel['challenger_name'])} 🆚 @{h(duel['challenged_name'])}\n\n"
+                f"🥇 <b>VAINQUEUR : @{h(poster_name)}</b>{bonus_txt}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📋 <b>Preuve de victoire :</b>\n\n"
+                f"  👤 Vainqueur : @{h(poster_name)}\n"
+                f"  📺 Canal : <b>{h(chat_title)}</b>\n"
+                f"  📦 Taille vidéo : <b>{size_mb:.2f} Mo</b>\n"
+                f"  🕐 Heure de publication : <code>{h(post_time_str)}</code>\n"
+                f"  ⏱️ Temps depuis le début : <b>{elapsed_min}min {elapsed_sec:02d}s</b>"
                 f"{loser_info}\n\n"
-                f"{'━' * 28}\n"
-                f"📊 *Mise à jour des scores :*\n\n"
-                f"  ✅ @{esc(poster_name)} : *\\+{points_won} pts* → Total : *{esc(total_winner)} pts*\n"
-                f"  ❌ @{esc(opponent_name)} : *{points_lost} pt* → Total : *{esc(total_opponent)} pts*\n\n"
-                f"{'━' * 28}\n"
-                f"🏅 Tape `/top` pour voir le classement \\!"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 <b>Mise à jour des scores :</b>\n\n"
+                f"  ✅ @{h(poster_name)} : <b>+{points_won} pts</b> → Total : <b>{total_winner} pts</b>\n"
+                f"  ❌ @{h(opponent_name)} : <b>{points_lost} pt</b> → Total : <b>{total_opponent} pts</b>\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏅 Tape /top pour voir le classement !"
             )
 
             try:
-                await context.bot.send_message(MAIN_GROUP_ID, victory_msg, parse_mode="MarkdownV2")
+                await context.bot.send_message(MAIN_GROUP_ID, victory_msg, parse_mode="HTML")
             except Exception as e:
                 logger.error(f"Erreur victoire: {e}")
 
@@ -1197,10 +1204,98 @@ def main():
         handle_video
     ))
 
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche l'ID du chat actuel et les duels actifs — pour déboguer."""
+    chat   = update.effective_chat
+    data   = load_data()
+
+    # Infos du chat
+    lines = [
+        f"🔍 *DEBUG INFO*\n",
+        f"📍 Ce chat : `{esc(str(chat.id))}`",
+        f"📝 Nom : {esc(chat.title or chat.username or 'N/A')}",
+        f"📋 Type : {esc(chat.type)}\n",
+    ]
+
+    # Canaux enregistrés
+    channels = data.get("registered_channels", {})
+    lines.append(f"📺 *Canaux enregistrés \\({len(channels)}\\) :*")
+    for cid, owner_id in channels.items():
+        owner = data["players"].get(str(owner_id), {}).get("username", "?") if owner_id else "?"
+        lines.append(f"  • `{esc(cid)}` → @{esc(owner)}")
+
+    # Duels actifs
+    duels = data.get("duels", {})
+    active = [(k, d) for k, d in duels.items() if d["status"] in ["active", "pending", "scheduled"]]
+    lines.append(f"\n⚔️ *Duels en cours \\({len(active)}\\) :*")
+    for k, d in active:
+        lines.append(
+            f"  • @{esc(d['challenger_name'])} vs @{esc(d['challenged_name'])}\n"
+            f"    Status: `{esc(d['status'])}`\n"
+            f"    Canal A: `{esc(str(d.get('challenger_channel', 'N/A')))}`\n"
+            f"    Canal B: `{esc(str(d.get('challenged_channel', 'N/A')))}`"
+        )
+
+    if not active:
+        lines.append("  Aucun duel actif")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Répond avec l'ID du chat — à utiliser depuis n'importe quel canal."""
+    msg  = update.message or update.channel_post
+    if not msg:
+        return
+    chat = msg.chat
+    await context.bot.send_message(
+        MAIN_GROUP_ID,
+        f"📍 ID du canal *{esc(chat.title or chat.username or 'N/A')}* : `{esc(str(chat.id))}`",
+        parse_mode="MarkdownV2"
+    )
+
+
+# ─────────────────────────────────────────────
+#  LANCEMENT
+# ─────────────────────────────────────────────
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start",        cmd_start))
+    app.add_handler(CommandHandler("help",         cmd_start))
+    app.add_handler(CommandHandler("join",         cmd_join))
+    app.add_handler(CommandHandler("mychannel",    cmd_mychannel))
+    app.add_handler(CommandHandler("addchannel",   cmd_addchannel))
+    app.add_handler(CommandHandler("channels",     cmd_channels))
+    app.add_handler(CommandHandler("settimezone",  cmd_settimezone))
+    app.add_handler(CommandHandler("duel",         cmd_duel))
+    app.add_handler(CommandHandler("accept",       cmd_accept))
+    app.add_handler(CommandHandler("decline",      cmd_decline))
+    app.add_handler(CommandHandler("cancel",       cmd_cancel))
+    app.add_handler(CommandHandler("top",          cmd_top))
+    app.add_handler(CommandHandler("classement",   cmd_top))
+    app.add_handler(CommandHandler("stats",        cmd_stats))
+    app.add_handler(CommandHandler("mystats",      cmd_stats))
+    app.add_handler(CommandHandler("regles",       cmd_regles))
+    app.add_handler(CommandHandler("resetpoints",  cmd_resetpoints))
+    app.add_handler(CommandHandler("debug",        cmd_debug))
+    app.add_handler(CommandHandler("chatid",       cmd_chatid))
+
+    app.add_handler(CallbackQueryHandler(callback_settz, pattern=r"^settz:"))
+
+    # Handler vidéo pour messages normaux (groupes)
+    app.add_handler(MessageHandler(
+        filters.VIDEO | filters.Document.MimeType("video/mp4"),
+        handle_video
+    ))
+    # Handler vidéo spécifique pour les posts de CANAUX
+    app.add_handler(MessageHandler(
+        filters.UpdateType.CHANNEL_POSTS & (filters.VIDEO | filters.Document.MimeType("video/mp4")),
+        handle_video
+    ))
+
     logger.info("🤖 DuelBot V4 démarré !")
-    # allowed_updates doit inclure channel_post pour recevoir les vidéos des canaux
-    app.run_polling(allowed_updates=["message", "channel_post", "callback_query", "edited_channel_post"])
-
-
-if __name__ == "__main__":
-    main()
+    app.run_polling(
+        allowed_updates=["message", "channel_post", "callback_query", "edited_channel_post"]
+    )
