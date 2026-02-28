@@ -1,6 +1,9 @@
 """
-🤖 DuelBot Telegram V3 — MarkdownV2 safe + fuseaux horaires
-Nécessite: pip install python-telegram-bot pytz
+🤖 DuelBot V4 — Canaux indépendants + déclaration de victoire complète
+- Chaque joueur enregistre SON canal personnel avec /mychannel
+- Le bot surveille les deux canaux séparément pendant un duel
+- Toutes les annonces (duel, victoire, classement) se font dans le GROUPE MÈRE
+- Nécessite: pip install python-telegram-bot pytz
 """
 
 import asyncio
@@ -22,12 +25,12 @@ from telegram.ext import (
 # ─────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────
-BOT_TOKEN      = os.environ.get("BOT_TOKEN")
-MAIN_GROUP_ID  = int(os.environ.get("MAIN_GROUP_ID", "0"))
-DATA_FILE      = "duel_data.json"
-DUEL_TIMEOUT   = 300
-ACCEPT_TIMEOUT = 300
-VIDEO_SIZE_LIMIT = 70 * 1024 * 1024
+BOT_TOKEN     = os.environ.get("BOT_TOKEN")
+MAIN_GROUP_ID = int(os.environ.get("MAIN_GROUP_ID", "0"))
+DATA_FILE     = "duel_data.json"
+DUEL_TIMEOUT  = 300       # 5 min pour poster après le début
+ACCEPT_TIMEOUT = 300      # 5 min pour accepter
+VIDEO_MIN_SIZE = 70 * 1024 * 1024  # 70 Mo
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -37,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 def esc(text: str) -> str:
-    """Échappe les caractères spéciaux pour MarkdownV2 Telegram."""
+    """Échappe les caractères spéciaux pour MarkdownV2."""
     special = r'_*[]()~`>#+-=|{}.!'
     return re.sub(f'([{re.escape(special)}])', r'\\\1', str(text))
 
@@ -63,21 +66,18 @@ COMMON_TIMEZONES = {
     "🌏 Tokyo":                       "Asia/Tokyo",
     "🌏 Pékin":                       "Asia/Shanghai",
 }
-
-TZ_STR_TO_LABEL = {tz: label for label, tz in COMMON_TIMEZONES.items()}
+TZ_STR_TO_LABEL = {v: k for k, v in COMMON_TIMEZONES.items()}
 
 
 def get_offset_str(tz_string: str) -> str:
     try:
         tz  = pytz.timezone(tz_string)
         now = datetime.now(tz)
-        offset = now.utcoffset()
-        total_seconds = int(offset.total_seconds())
+        total_seconds = int(now.utcoffset().total_seconds())
         sign = "+" if total_seconds >= 0 else "-"
         total_seconds = abs(total_seconds)
-        hours, remainder = divmod(total_seconds, 3600)
-        minutes = remainder // 60
-        return f"UTC{sign}{hours:02d}:{minutes:02d}"
+        h, rem = divmod(total_seconds, 3600)
+        return f"UTC{sign}{h:02d}:{rem//60:02d}"
     except Exception:
         return "UTC?"
 
@@ -116,7 +116,12 @@ def load_data() -> dict:
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"players": {}, "duels": {}, "history": [], "monitored_chats": []}
+    return {
+        "players": {},
+        "duels": {},
+        "history": [],
+        "registered_channels": {}   # chat_id → owner_user_id
+    }
 
 
 def save_data(data: dict):
@@ -125,7 +130,7 @@ def save_data(data: dict):
 
 
 # ─────────────────────────────────────────────
-#  HELPERS
+#  HELPERS JOUEURS
 # ─────────────────────────────────────────────
 
 def get_player(data: dict, user_id: int, username: str = None) -> dict:
@@ -135,11 +140,22 @@ def get_player(data: dict, user_id: int, username: str = None) -> dict:
             "username": username or str(user_id),
             "points": 0, "wins": 0, "losses": 0,
             "duels_played": 0, "timezone": None,
+            "channel_id": None,      # canal personnel du joueur
+            "channel_name": None,
             "joined": datetime.now().isoformat()
         }
     elif username:
         data["players"][uid]["username"] = username
     return data["players"][uid]
+
+
+def get_player_by_username(data: dict, username: str):
+    """Retourne (uid_str, player_dict) ou (None, None)."""
+    uname = username.lower().lstrip("@")
+    for uid, p in data["players"].items():
+        if p.get("username", "").lower() == uname:
+            return uid, p
+    return None, None
 
 
 def format_leaderboard(data: dict) -> str:
@@ -150,57 +166,296 @@ def format_leaderboard(data: dict) -> str:
     medals = ["🥇", "🥈", "🥉"]
     lines  = ["🏆 *CLASSEMENT DES DUELS*\n"]
     for i, (uid, p) in enumerate(players[:10]):
-        medal  = medals[i] if i < 3 else f"{i+1}\\."
-        name   = esc(p.get("username", uid))
-        pts    = esc(p["points"])
-        wins   = p.get("wins", 0)
-        losses = p.get("losses", 0)
-        lines.append(f"{medal} @{name} — *{pts} pts* \\({wins}W/{losses}L\\)")
+        medal = medals[i] if i < 3 else f"{i+1}\\."
+        name  = esc(p.get("username", uid))
+        pts   = esc(p["points"])
+        w     = p.get("wins", 0)
+        l     = p.get("losses", 0)
+        ch    = f" 📺" if p.get("channel_name") else ""
+        lines.append(f"{medal} @{name}{ch} — *{pts} pts* \\({w}W/{l}L\\)")
     return "\n".join(lines)
 
 
-async def get_member_in_chat(bot, chat_id: int, user_id: int) -> Optional[ChatMember]:
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        if member.status in [ChatMember.LEFT, ChatMember.BANNED]:
-            return None
-        return member
-    except Exception:
-        return None
+# ─────────────────────────────────────────────
+#  /start & /help
+# ─────────────────────────────────────────────
 
-
-async def find_common_chat(bot, data: dict, user1_id: int, user2_id: int) -> Optional[int]:
-    for chat_id in data.get("monitored_chats", []):
-        try:
-            bot_member = await bot.get_chat_member(chat_id, bot.id)
-            if bot_member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-                continue
-            m1 = await get_member_in_chat(bot, chat_id, user1_id)
-            m2 = await get_member_in_chat(bot, chat_id, user2_id)
-            if m1 and m2:
-                return chat_id
-        except Exception:
-            continue
-    return None
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "👋 *Bienvenue sur DuelBot V4 \\!*\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "📋 *INSCRIPTION*\n"
+        "`/join` — S'inscrire au classement\n"
+        "`/mychannel` — Enregistrer ton canal de duel\n"
+        "`/settimezone` — Définir ton fuseau horaire\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚔️ *DUELS*\n"
+        "`/duel @pseudo` — Duel immédiat\n"
+        "`/duel @pseudo 18:30` — Duel planifié \\(ton heure\\)\n"
+        "`/duel @pseudo 18:30 25/07` — Date précise\n"
+        "`/accept` — Accepter un duel\n"
+        "`/decline` — Refuser un duel\n"
+        "`/cancel` — Annuler son duel en cours\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 *STATS*\n"
+        "`/top` — Classement général\n"
+        "`/stats` — Ses statistiques\n"
+        "`/mystats` — Ses stats détaillées\n"
+        "`/regles` — Règles du jeu\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔧 *ADMIN*\n"
+        "`/addchannel` — Ajouter un canal au bot\n"
+        "`/channels` — Voir les canaux enregistrés\n"
+        "`/resetpoints @pseudo` — Remettre à zéro\n"
+    )
+    await update.message.reply_text(msg, parse_mode="MarkdownV2")
 
 
 # ─────────────────────────────────────────────
-#  FUSEAU — /settimezone
+#  /join
+# ─────────────────────────────────────────────
+
+async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    data = load_data()
+    uid  = str(user.id)
+    name = user.username or user.first_name
+
+    if uid in data["players"]:
+        p = data["players"][uid]
+        ch_info = f"\n📺 Canal enregistré : *{esc(p.get('channel_name', 'Aucun'))}*" if p.get("channel_name") else "\n📺 Pas encore de canal \\— utilise `/mychannel`"
+        await update.message.reply_text(
+            f"✅ @{esc(name)}, tu es déjà inscrit \\!{ch_info}",
+            parse_mode="MarkdownV2"
+        )
+    else:
+        get_player(data, user.id, name)
+        save_data(data)
+        await update.message.reply_text(
+            f"🎉 *Bienvenue @{esc(name)} \\!* Tu es maintenant inscrit\\.\n\n"
+            f"Prochaines étapes :\n"
+            f"1️⃣ `/mychannel` — Enregistre ton canal de duel\n"
+            f"2️⃣ `/settimezone` — Définis ton fuseau horaire\n"
+            f"3️⃣ `/duel @pseudo` — Lance ton premier duel \\!",
+            parse_mode="MarkdownV2"
+        )
+
+
+# ─────────────────────────────────────────────
+#  /mychannel — Enregistrer son canal personnel
+# ─────────────────────────────────────────────
+
+async def cmd_mychannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Utilisé DEPUIS le canal : le bot enregistre ce canal comme canal du joueur.
+    Ou depuis le groupe avec un argument : /mychannel @channelusername
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    data = load_data()
+
+    # Si utilisé depuis un canal directement
+    if chat.type in ["channel", "supergroup"] and chat.id != MAIN_GROUP_ID:
+        # Vérifier que le bot est admin dans ce canal
+        try:
+            bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
+            if bot_member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
+                await update.message.reply_text(
+                    "❌ Je dois être admin dans ce canal pour l'enregistrer\\.",
+                    parse_mode="MarkdownV2"
+                )
+                return
+        except Exception:
+            pass
+
+        # Enregistrer
+        p = get_player(data, user.id, user.username or user.first_name)
+        p["channel_id"]   = chat.id
+        p["channel_name"] = chat.title or chat.username or str(chat.id)
+
+        if "registered_channels" not in data:
+            data["registered_channels"] = {}
+        data["registered_channels"][str(chat.id)] = user.id
+
+        save_data(data)
+
+        ch_name = chat.title or chat.username or str(chat.id)
+        await update.message.reply_text(
+            f"✅ Canal *{esc(ch_name)}* enregistré comme ton canal de duel \\!\n"
+            f"Les duels te concernant seront surveillés ici\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    # Si utilisé depuis le groupe principal avec un argument (ID ou @username)
+    if context.args:
+        channel_ref = context.args[0]
+        try:
+            # Essayer par ID ou @username
+            if channel_ref.lstrip("-").isdigit():
+                channel_id = int(channel_ref)
+            else:
+                channel_ref_clean = channel_ref if channel_ref.startswith("@") else f"@{channel_ref}"
+                chat_obj   = await context.bot.get_chat(channel_ref_clean)
+                channel_id = chat_obj.id
+
+            ch_obj  = await context.bot.get_chat(channel_id)
+            ch_name = ch_obj.title or ch_obj.username or str(channel_id)
+
+            # Vérifier que le bot est admin
+            try:
+                bot_member = await context.bot.get_chat_member(channel_id, context.bot.id)
+                if bot_member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
+                    await update.message.reply_text(
+                        f"❌ Je ne suis pas admin dans *{esc(ch_name)}*\\. Ajoute\\-moi comme admin d'abord \\!",
+                        parse_mode="MarkdownV2"
+                    )
+                    return
+            except Exception:
+                await update.message.reply_text("❌ Impossible d'accéder à ce canal\\. Vérifie que je suis admin dedans\\.", parse_mode="MarkdownV2")
+                return
+
+            p = get_player(data, user.id, user.username or user.first_name)
+            p["channel_id"]   = channel_id
+            p["channel_name"] = ch_name
+
+            if "registered_channels" not in data:
+                data["registered_channels"] = {}
+            data["registered_channels"][str(channel_id)] = user.id
+
+            save_data(data)
+            await update.message.reply_text(
+                f"✅ *{esc(ch_name)}* enregistré comme ton canal de duel \\!\n"
+                f"Les vidéos postées là\\-dedans compteront pour tes duels\\.",
+                parse_mode="MarkdownV2"
+            )
+
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Canal introuvable ou inaccessible\\.\n"
+                f"Assure\\-toi que je suis admin dans le canal et réessaie\\.\n\n"
+                f"Usage : `/mychannel @nomdcanal` ou `/mychannel -1001234567890`",
+                parse_mode="MarkdownV2"
+            )
+        return
+
+    # Instructions si aucun argument
+    await update.message.reply_text(
+        "📺 *Enregistrer ton canal de duel :*\n\n"
+        "*Méthode 1* — Depuis ton canal :\n"
+        "1\\. Ajoute le bot dans ton canal comme admin\n"
+        "2\\. Tape `/mychannel` directement dans le canal\n\n"
+        "*Méthode 2* — Depuis ce groupe :\n"
+        "`/mychannel @nomdcanal`\n"
+        "ou\n"
+        "`/mychannel -1001234567890` \\(l'ID du canal\\)\n\n"
+        "💡 Le bot doit être *admin* dans ton canal pour détecter les vidéos\\.",
+        parse_mode="MarkdownV2"
+    )
+
+
+# ─────────────────────────────────────────────
+#  /addchannel — Admin : ajouter n'importe quel canal
+# ─────────────────────────────────────────────
+
+async def cmd_addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin seulement : ajouter un canal à la liste surveillée sans l'associer à un joueur."""
+    user = update.effective_user
+    data = load_data()
+
+    try:
+        member = await context.bot.get_chat_member(MAIN_GROUP_ID, user.id)
+        if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
+            await update.message.reply_text("❌ Commande réservée aux admins\\.", parse_mode="MarkdownV2")
+            return
+    except Exception:
+        pass
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage : `/addchannel @canal` ou `/addchannel -1001234567890`",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    channel_ref = context.args[0]
+    try:
+        if channel_ref.lstrip("-").isdigit():
+            channel_id = int(channel_ref)
+        else:
+            channel_ref_clean = channel_ref if channel_ref.startswith("@") else f"@{channel_ref}"
+            ch_obj     = await context.bot.get_chat(channel_ref_clean)
+            channel_id = ch_obj.id
+
+        ch_obj  = await context.bot.get_chat(channel_id)
+        ch_name = ch_obj.title or ch_obj.username or str(channel_id)
+
+        if "registered_channels" not in data:
+            data["registered_channels"] = {}
+
+        if str(channel_id) not in data["registered_channels"]:
+            data["registered_channels"][str(channel_id)] = None  # pas de propriétaire défini
+            save_data(data)
+            await update.message.reply_text(
+                f"✅ Canal *{esc(ch_name)}* ajouté à la surveillance\\.",
+                parse_mode="MarkdownV2"
+            )
+        else:
+            await update.message.reply_text(f"ℹ️ Ce canal est déjà enregistré\\.", parse_mode="MarkdownV2")
+
+    except Exception:
+        await update.message.reply_text("❌ Canal introuvable ou inaccessible\\.", parse_mode="MarkdownV2")
+
+
+# ─────────────────────────────────────────────
+#  /channels — Lister les canaux enregistrés
+# ─────────────────────────────────────────────
+
+async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data     = load_data()
+    channels = data.get("registered_channels", {})
+
+    if not channels:
+        await update.message.reply_text(
+            "ℹ️ Aucun canal enregistré\\.\nUtilise `/mychannel` pour enregistrer le tien\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    lines = [f"📺 *Canaux enregistrés \\({len(channels)}\\) :*\n"]
+    for cid, owner_id in channels.items():
+        try:
+            ch     = await context.bot.get_chat(int(cid))
+            ch_name = esc(ch.title or ch.username or cid)
+        except Exception:
+            ch_name = esc(str(cid))
+
+        if owner_id:
+            owner_p = data["players"].get(str(owner_id), {})
+            owner_name = esc(owner_p.get("username", str(owner_id)))
+            lines.append(f"• *{ch_name}* → @{owner_name}")
+        else:
+            lines.append(f"• *{ch_name}* → \\(sans propriétaire\\)")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ─────────────────────────────────────────────
+#  /settimezone
 # ─────────────────────────────────────────────
 
 def tz_keyboard(user_id: int) -> InlineKeyboardMarkup:
     buttons = []
     for label, tz_str in COMMON_TIMEZONES.items():
-        offset   = get_offset_str(tz_str)
-        btn_text = f"{label} ({offset})"
-        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"settz:{user_id}:{tz_str}")])
+        offset = get_offset_str(tz_str)
+        buttons.append([InlineKeyboardButton(f"{label} ({offset})", callback_data=f"settz:{user_id}:{tz_str}")])
     return InlineKeyboardMarkup(buttons)
 
 
 async def cmd_settimezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
-        "🌍 *Choisis ton fuseau horaire :*\nIl sera utilisé pour les duels planifiés\\.",
+        "🌍 *Choisis ton fuseau horaire :*",
         reply_markup=tz_keyboard(user.id),
         parse_mode="MarkdownV2"
     )
@@ -216,61 +471,80 @@ async def callback_settz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.from_user.id != int(uid_str):
         await query.answer("❌ Ce menu n'est pas pour toi.", show_alert=True)
         return
-    data = load_data()
-    p    = get_player(data, int(uid_str), query.from_user.username or query.from_user.first_name)
+    data  = load_data()
+    p     = get_player(data, int(uid_str), query.from_user.username or query.from_user.first_name)
     p["timezone"] = tz_str
     save_data(data)
     label  = TZ_STR_TO_LABEL.get(tz_str, tz_str)
     offset = get_offset_str(tz_str)
     await query.edit_message_text(
-        f"✅ Fuseau enregistré : *{esc(label)}* \\({esc(offset)}\\)\n"
-        f"Les heures de duel te seront affichées dans ce fuseau\\.",
+        f"✅ Fuseau enregistré : *{esc(label)}* \\({esc(offset)}\\)",
         parse_mode="MarkdownV2"
     )
 
 
 # ─────────────────────────────────────────────
-#  /duel
+#  /duel — Lancer un duel
 # ─────────────────────────────────────────────
 
 async def cmd_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Seulement depuis le groupe mère
+    if update.effective_chat.id != MAIN_GROUP_ID:
+        await update.message.reply_text(
+            f"❌ Les duels doivent être lancés depuis le groupe principal\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
     challenger = update.effective_user
     data       = load_data()
 
     if not context.args:
         await update.message.reply_text(
-            "❌ Usage :\n"
-            "`/duel @pseudo` — duel immédiat\n"
-            "`/duel @pseudo 18:30` — aujourd'hui à 18h30\n"
-            "`/duel @pseudo 18:30 25/07` — date précise",
+            "❌ Usage :\n`/duel @pseudo` — duel immédiat\n`/duel @pseudo 18:30` — planifié",
             parse_mode="MarkdownV2"
         )
         return
 
     target_username = context.args[0].lstrip("@").lower()
-    target_uid, target_data = None, None
-    for uid, p in data.get("players", {}).items():
-        if p.get("username", "").lower() == target_username:
-            target_uid  = int(uid)
-            target_data = p
-            break
+    target_uid_str, target_p = get_player_by_username(data, target_username)
 
-    if not target_uid:
+    if not target_uid_str:
         await update.message.reply_text(
             f"❌ @{esc(target_username)} n'est pas inscrit\\. Il/elle doit faire `/join` d'abord \\!",
             parse_mode="MarkdownV2"
         )
         return
 
+    target_uid = int(target_uid_str)
+
     if target_uid == challenger.id:
         await update.message.reply_text("😂 Tu ne peux pas te défier toi\\-même \\!", parse_mode="MarkdownV2")
         return
 
-    duel_key = f"{min(challenger.id, target_uid)}_{max(challenger.id, target_uid)}"
-    if duel_key in data.get("duels", {}):
-        await update.message.reply_text("⚠️ Un duel est déjà en cours entre vous deux \\!")
+    # Vérifier que les deux ont un canal enregistré
+    challenger_p = get_player(data, challenger.id, challenger.username or challenger.first_name)
+    if not challenger_p.get("channel_id"):
+        await update.message.reply_text(
+            "❌ Tu n'as pas encore enregistré ton canal de duel\\.\nUtilise `/mychannel` d'abord \\!",
+            parse_mode="MarkdownV2"
+        )
         return
 
+    if not target_p.get("channel_id"):
+        await update.message.reply_text(
+            f"❌ @{esc(target_username)} n'a pas encore enregistré son canal de duel\\.\n"
+            f"Il/elle doit utiliser `/mychannel` d'abord \\!",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    duel_key = f"{min(challenger.id, target_uid)}_{max(challenger.id, target_uid)}"
+    if duel_key in data.get("duels", {}):
+        await update.message.reply_text("⚠️ Un duel est déjà en cours entre vous deux \\!", parse_mode="MarkdownV2")
+        return
+
+    # Gestion du temps planifié
     scheduled_ts = None
     display_info = ""
 
@@ -279,16 +553,15 @@ async def cmd_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         naive_dt = parse_time_input(time_str)
         if naive_dt is None:
             await update.message.reply_text(
-                "❌ Format d'heure invalide\\.\nExemples : `18:30` · `18:30 25/07` · `25/07/2025 18:30`",
+                "❌ Format d'heure invalide\\.\nExemples : `18:30` · `18:30 25/07`",
                 parse_mode="MarkdownV2"
             )
             return
 
-        challenger_p      = get_player(data, challenger.id, challenger.username or challenger.first_name)
-        challenger_tz_str = challenger_p.get("timezone") or "UTC"
-        challenger_tz     = pytz.timezone(challenger_tz_str)
-        aware_dt          = challenger_tz.localize(naive_dt)
-        now_utc           = datetime.now(pytz.utc)
+        tz_str_c  = challenger_p.get("timezone") or "UTC"
+        tz_c      = pytz.timezone(tz_str_c)
+        aware_dt  = tz_c.localize(naive_dt)
+        now_utc   = datetime.now(pytz.utc)
 
         if aware_dt < now_utc + timedelta(minutes=2):
             await update.message.reply_text(
@@ -297,67 +570,69 @@ async def cmd_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        scheduled_ts      = aware_dt.timestamp()
-        challenged_tz_str = target_data.get("timezone") or "UTC"
-        challenged_tz     = pytz.timezone(challenged_tz_str)
-        dt_for_challenged = aware_dt.astimezone(challenged_tz)
-        dt_for_challenger = aware_dt.astimezone(challenger_tz)
-        off_challenger    = get_offset_str(challenger_tz_str)
-        off_challenged    = get_offset_str(challenged_tz_str)
-        lbl_challenger    = TZ_STR_TO_LABEL.get(challenger_tz_str, challenger_tz_str)
-        lbl_challenged    = TZ_STR_TO_LABEL.get(challenged_tz_str, challenged_tz_str)
+        scheduled_ts  = aware_dt.timestamp()
+        tz_str_t      = target_p.get("timezone") or "UTC"
+        tz_t          = pytz.timezone(tz_str_t)
+        dt_challenger = aware_dt.astimezone(tz_c)
+        dt_challenged = aware_dt.astimezone(tz_t)
+        lbl_c  = TZ_STR_TO_LABEL.get(tz_str_c, tz_str_c)
+        lbl_t  = TZ_STR_TO_LABEL.get(tz_str_t, tz_str_t)
+        off_c  = get_offset_str(tz_str_c)
+        off_t  = get_offset_str(tz_str_t)
 
-        chal_name = esc(challenger.username or challenger.first_name)
-        tgt_name  = esc(target_username)
-
+        cname  = esc(challenger.username or challenger.first_name)
+        tname  = esc(target_username)
         display_info = (
-            f"\n\n🗓️ *Heure du duel proposée :*\n"
-            f"  • Pour toi \\(@{chal_name}\\) : "
-            f"`{esc(dt_for_challenger.strftime('%d/%m/%Y %H:%M'))}` _{esc(lbl_challenger)} \\({esc(off_challenger)}\\)_\n"
-            f"  • Pour @{tgt_name} : "
-            f"`{esc(dt_for_challenged.strftime('%d/%m/%Y %H:%M'))}` _{esc(lbl_challenged)} \\({esc(off_challenged)}\\)_\n"
+            f"\n\n🗓️ *Heure du duel :*\n"
+            f"  📍 @{cname} : `{esc(dt_challenger.strftime('%d/%m/%Y %H:%M'))}` _{esc(lbl_c)} \\({esc(off_c)}\\)_\n"
+            f"  📍 @{tname} : `{esc(dt_challenged.strftime('%d/%m/%Y %H:%M'))}` _{esc(lbl_t)} \\({esc(off_t)}\\)_\n"
         )
-        if not target_data.get("timezone"):
-            display_info += (
-                f"\n⚠️ @{tgt_name} n'a pas encore défini son fuseau \\(`/settimezone`\\)\\. "
-                f"L'heure affichée est en UTC\\."
-            )
+        if not target_p.get("timezone"):
+            display_info += f"\n⚠️ @{tname} n'a pas défini son fuseau \\(`/settimezone`\\)\\."
 
+    # Créer le duel
     if "duels" not in data:
         data["duels"] = {}
 
     data["duels"][duel_key] = {
-        "challenger_id":   challenger.id,
-        "challenger_name": challenger.username or challenger.first_name,
-        "challenged_id":   target_uid,
-        "challenged_name": target_data["username"],
-        "chat_id":         None,
-        "status":          "pending",
-        "created_at":      time.time(),
-        "scheduled_ts":    scheduled_ts,
-        "chat_id_origin":  update.effective_chat.id,
-        "penalty_flag":    {}
+        "challenger_id":      challenger.id,
+        "challenger_name":    challenger.username or challenger.first_name,
+        "challenger_channel": challenger_p["channel_id"],
+        "challenged_id":      target_uid,
+        "challenged_name":    target_p["username"],
+        "challenged_channel": target_p["channel_id"],
+        "status":             "pending",
+        "created_at":         time.time(),
+        "scheduled_ts":       scheduled_ts,
+        "penalty_flag":       {},
+        "videos_posted":      {}   # user_id → {"size": x, "ts": t}
     }
     save_data(data)
 
-    chal_name = esc(challenger.username or challenger.first_name)
-    tgt_name  = esc(target_data["username"])
+    cname = esc(challenger.username or challenger.first_name)
+    tname = esc(target_p["username"])
+    ch_c  = esc(challenger_p.get("channel_name", "son canal"))
+    ch_t  = esc(target_p.get("channel_name", "son canal"))
 
     if scheduled_ts:
         msg = (
             f"⚔️ *DÉFI PLANIFIÉ \\!*\n\n"
-            f"@{chal_name} défie @{tgt_name} \\!"
-            f"{display_info}\n"
-            f"@{tgt_name}, réponds avec `/accept` ou `/decline`\\.\n"
-            f"⏱️ Tu as 5 minutes pour répondre\\."
+            f"@{cname} 🆚 @{tname}\n\n"
+            f"📺 Canal de @{cname} : *{ch_c}*\n"
+            f"📺 Canal de @{tname} : *{ch_t}*"
+            f"{display_info}\n\n"
+            f"@{tname}, réponds avec `/accept` ou `/decline`\\.\n"
+            f"⏱️ 5 minutes pour répondre\\."
         )
     else:
         msg = (
             f"⚔️ *DÉFI LANCÉ \\!*\n\n"
-            f"@{chal_name} défie @{tgt_name} en duel immédiat \\!\\!\n\n"
-            f"@{tgt_name}, réponds avec `/accept` pour accepter "
+            f"@{cname} 🆚 @{tname}\n\n"
+            f"📺 Canal de @{cname} : *{ch_c}*\n"
+            f"📺 Canal de @{tname} : *{ch_t}*\n\n"
+            f"@{tname}, réponds avec `/accept` pour accepter "
             f"ou `/decline` pour refuser\\.\n"
-            f"⏱️ Tu as 5 minutes pour répondre\\."
+            f"⏱️ 5 minutes pour répondre\\."
         )
 
     await update.message.reply_text(msg, parse_mode="MarkdownV2")
@@ -380,31 +655,15 @@ async def cmd_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
 
     if not active_duel:
-        await update.message.reply_text("❌ Tu n'as aucun duel en attente.")
+        await update.message.reply_text("❌ Tu n'as aucun duel en attente\\.", parse_mode="MarkdownV2")
         return
 
-    common_chat = await find_common_chat(
-        context.bot, data, active_duel["challenger_id"], active_duel["challenged_id"]
-    )
-    if not common_chat:
-        await update.message.reply_text(
-            "❌ Aucun canal commun trouvé\\. Assurez\\-vous d'être dans un canal surveillé par le bot\\.",
-            parse_mode="MarkdownV2"
-        )
-        return
-
-    active_duel["chat_id"] = common_chat
-    origin_chat = active_duel.get("chat_id_origin", MAIN_GROUP_ID)
-
-    try:
-        chat      = await context.bot.get_chat(common_chat)
-        chat_name = chat.title or chat.username or str(common_chat)
-    except Exception:
-        chat_name = str(common_chat)
+    cname  = esc(active_duel["challenger_name"])
+    chname = esc(active_duel["challenged_name"])
+    ch_c   = esc(data["players"].get(str(active_duel["challenger_id"]), {}).get("channel_name", "canal inconnu"))
+    ch_t   = esc(data["players"].get(str(active_duel["challenged_id"]), {}).get("channel_name", "canal inconnu"))
 
     scheduled_ts = active_duel.get("scheduled_ts")
-    chal_name    = esc(active_duel["challenger_name"])
-    chld_name    = esc(active_duel["challenged_name"])
 
     if scheduled_ts:
         active_duel["status"] = "scheduled"
@@ -413,37 +672,38 @@ async def cmd_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         now_utc      = datetime.now(pytz.utc)
         start_dt_utc = datetime.fromtimestamp(scheduled_ts, tz=pytz.utc)
         delta        = start_dt_utc - now_utc
-        minutes_until = int(delta.total_seconds() // 60)
-        seconds_until = int(delta.total_seconds() % 60)
+        min_until    = int(delta.total_seconds() // 60)
+        sec_until    = int(delta.total_seconds() % 60)
 
-        p1   = data["players"].get(str(active_duel["challenger_id"]), {})
-        p2   = data["players"].get(str(active_duel["challenged_id"]), {})
-        tz1  = pytz.timezone(p1.get("timezone") or "UTC")
-        tz2  = pytz.timezone(p2.get("timezone") or "UTC")
-        dt1  = start_dt_utc.astimezone(tz1)
-        dt2  = start_dt_utc.astimezone(tz2)
-        off1 = get_offset_str(p1.get("timezone") or "UTC")
-        off2 = get_offset_str(p2.get("timezone") or "UTC")
-        lbl1 = TZ_STR_TO_LABEL.get(p1.get("timezone") or "UTC", p1.get("timezone") or "UTC")
-        lbl2 = TZ_STR_TO_LABEL.get(p2.get("timezone") or "UTC", p2.get("timezone") or "UTC")
+        p1    = data["players"].get(str(active_duel["challenger_id"]), {})
+        p2    = data["players"].get(str(active_duel["challenged_id"]), {})
+        tz1   = pytz.timezone(p1.get("timezone") or "UTC")
+        tz2   = pytz.timezone(p2.get("timezone") or "UTC")
+        dt1   = start_dt_utc.astimezone(tz1)
+        dt2   = start_dt_utc.astimezone(tz2)
+        lbl1  = TZ_STR_TO_LABEL.get(p1.get("timezone") or "UTC", "UTC")
+        lbl2  = TZ_STR_TO_LABEL.get(p2.get("timezone") or "UTC", "UTC")
+        off1  = get_offset_str(p1.get("timezone") or "UTC")
+        off2  = get_offset_str(p2.get("timezone") or "UTC")
 
         msg = (
             f"✅ *DUEL PLANIFIÉ CONFIRMÉ \\!*\n\n"
-            f"⚔️ @{chal_name} VS @{chld_name}\n"
-            f"📍 Canal : *{esc(chat_name)}*\n\n"
+            f"⚔️ @{cname} 🆚 @{chname}\n\n"
+            f"📺 *Canaux de duel :*\n"
+            f"  • @{cname} poste dans *{ch_c}*\n"
+            f"  • @{chname} poste dans *{ch_t}*\n\n"
             f"🕐 *Début du duel :*\n"
-            f"  • @{chal_name} : `{esc(dt1.strftime('%d/%m/%Y %H:%M'))}` _{esc(lbl1)} \\({esc(off1)}\\)_\n"
-            f"  • @{chld_name} : `{esc(dt2.strftime('%d/%m/%Y %H:%M'))}` _{esc(lbl2)} \\({esc(off2)}\\)_\n\n"
-            f"⏳ Début dans *{esc(minutes_until)}min {seconds_until:02d}s*\n\n"
-            f"📢 Rappel 5 minutes avant le début \\!"
+            f"  • @{cname} : `{esc(dt1.strftime('%d/%m/%Y %H:%M'))}` _{esc(lbl1)} \\({esc(off1)}\\)_\n"
+            f"  • @{chname} : `{esc(dt2.strftime('%d/%m/%Y %H:%M'))}` _{esc(lbl2)} \\({esc(off2)}\\)_\n\n"
+            f"⏳ Début dans *{esc(min_until)}min {sec_until:02d}s*\n"
+            f"📢 Rappel 5 minutes avant \\!"
         )
-
         await update.message.reply_text(msg, parse_mode="MarkdownV2")
-        if update.effective_chat.id != MAIN_GROUP_ID:
-            try:
+        try:
+            if update.effective_chat.id != MAIN_GROUP_ID:
                 await context.bot.send_message(MAIN_GROUP_ID, msg, parse_mode="MarkdownV2")
-            except Exception:
-                pass
+        except Exception:
+            pass
         asyncio.create_task(scheduled_duel_start(context.bot, active_key, scheduled_ts))
 
     else:
@@ -452,28 +712,74 @@ async def cmd_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
 
         msg = (
-            f"🔥 *DUEL LANCÉ IMMÉDIATEMENT \\!*\n\n"
-            f"⚔️ @{chal_name} VS @{chld_name}\n"
-            f"📍 Canal : *{esc(chat_name)}*\n\n"
-            f"⏱️ Vous avez *5 minutes* pour poster une vidéo \\!\n"
-            f"🎬 Vidéo ≥ 70 Mo en premier \\= victoire \\(\\+3 pts\\)\n"
-            f"⚠️ Vidéo \\< 70 Mo \\= \\-3 pts \\(mais rattrapable avec \\+6 pts \\!\\)"
+            f"🔥 *DUEL COMMENCÉ \\!*\n\n"
+            f"⚔️ @{cname} 🆚 @{chname}\n\n"
+            f"📺 *Canaux surveillés :*\n"
+            f"  • @{cname} poste dans *{ch_c}*\n"
+            f"  • @{chname} poste dans *{ch_t}*\n\n"
+            f"⏱️ *5 minutes* pour poster une vidéo \\!\n"
+            f"🎬 Vidéo ≥ 70 Mo en premier \\= *victoire \\+3 pts*\n"
+            f"⚠️ Vidéo \\< 70 Mo \\= *\\-3 pts* \\(rattrapable \\+6 pts\\)\n\n"
+            f"🏁 Le bot annoncera le vainqueur ici dès qu'une vidéo valide est postée \\!"
         )
         await update.message.reply_text(msg, parse_mode="MarkdownV2")
-        if update.effective_chat.id != MAIN_GROUP_ID:
-            try:
+        try:
+            if update.effective_chat.id != MAIN_GROUP_ID:
                 await context.bot.send_message(MAIN_GROUP_ID, msg, parse_mode="MarkdownV2")
-            except Exception:
-                pass
+        except Exception:
+            pass
         asyncio.create_task(duel_video_timeout(context.bot, active_key))
 
 
 # ─────────────────────────────────────────────
-#  DUEL PLANIFIÉ — démarrage auto
+#  /decline & /cancel
+# ─────────────────────────────────────────────
+
+async def cmd_decline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    data = load_data()
+    for key, duel in list(data.get("duels", {}).items()):
+        if duel["challenged_id"] == user.id and duel["status"] == "pending":
+            cname = esc(duel["challenger_name"])
+            uname = esc(user.username or user.first_name)
+            del data["duels"][key]
+            save_data(data)
+            msg = f"❌ @{uname} a refusé le duel de @{cname}\\."
+            await update.message.reply_text(msg, parse_mode="MarkdownV2")
+            try:
+                await context.bot.send_message(MAIN_GROUP_ID, msg, parse_mode="MarkdownV2")
+            except Exception:
+                pass
+            return
+    await update.message.reply_text("❌ Tu n'as aucun duel en attente à refuser\\.", parse_mode="MarkdownV2")
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    data = load_data()
+    for key, duel in list(data.get("duels", {}).items()):
+        if user.id in [duel["challenger_id"], duel["challenged_id"]]:
+            cname = esc(duel["challenger_name"])
+            tname = esc(duel["challenged_name"])
+            uname = esc(user.username or user.first_name)
+            del data["duels"][key]
+            save_data(data)
+            msg = f"🚫 Duel @{cname} 🆚 @{tname} annulé par @{uname}\\."
+            await update.message.reply_text(msg, parse_mode="MarkdownV2")
+            try:
+                await context.bot.send_message(MAIN_GROUP_ID, msg, parse_mode="MarkdownV2")
+            except Exception:
+                pass
+            return
+    await update.message.reply_text("❌ Tu n'as aucun duel actif à annuler\\.", parse_mode="MarkdownV2")
+
+
+# ─────────────────────────────────────────────
+#  DUEL PLANIFIÉ — démarrage automatique
 # ─────────────────────────────────────────────
 
 async def scheduled_duel_start(bot, duel_key: str, scheduled_ts: float):
-    now        = time.time()
+    now         = time.time()
     reminder_ts = scheduled_ts - 300
 
     if reminder_ts > now:
@@ -481,13 +787,12 @@ async def scheduled_duel_start(bot, duel_key: str, scheduled_ts: float):
         data = load_data()
         if duel_key not in data.get("duels", {}) or data["duels"][duel_key]["status"] != "scheduled":
             return
-        duel        = data["duels"][duel_key]
-        origin_chat = duel.get("chat_id_origin", MAIN_GROUP_ID)
+        duel = data["duels"][duel_key]
         try:
             await bot.send_message(
-                origin_chat,
+                MAIN_GROUP_ID,
                 f"⏰ *RAPPEL — 5 minutes \\!*\n\n"
-                f"⚔️ @{esc(duel['challenger_name'])} VS @{esc(duel['challenged_name'])}\n"
+                f"⚔️ @{esc(duel['challenger_name'])} 🆚 @{esc(duel['challenged_name'])}\n"
                 f"Le duel commence dans *5 minutes* \\! Préparez vos vidéos 🎬",
                 parse_mode="MarkdownV2"
             )
@@ -502,81 +807,34 @@ async def scheduled_duel_start(bot, duel_key: str, scheduled_ts: float):
     if duel_key not in data.get("duels", {}) or data["duels"][duel_key]["status"] != "scheduled":
         return
 
-    duel        = data["duels"][duel_key]
-    origin_chat = duel.get("chat_id_origin", MAIN_GROUP_ID)
-    common_chat = duel.get("chat_id")
-
-    try:
-        chat      = await bot.get_chat(common_chat)
-        chat_name = chat.title or chat.username or str(common_chat)
-    except Exception:
-        chat_name = str(common_chat)
-
+    duel = data["duels"][duel_key]
     duel["status"]     = "active"
     duel["started_at"] = time.time()
     save_data(data)
 
+    p1    = data["players"].get(str(duel["challenger_id"]), {})
+    p2    = data["players"].get(str(duel["challenged_id"]), {})
+    ch_c  = esc(p1.get("channel_name", "son canal"))
+    ch_t  = esc(p2.get("channel_name", "son canal"))
+    cname = esc(duel["challenger_name"])
+    tname = esc(duel["challenged_name"])
+
     msg = (
         f"🔥 *LE DUEL COMMENCE \\!*\n\n"
-        f"⚔️ @{esc(duel['challenger_name'])} VS @{esc(duel['challenged_name'])}\n"
-        f"📍 Canal : *{esc(chat_name)}*\n\n"
-        f"⏱️ Vous avez *5 minutes* pour poster une vidéo \\!\n"
-        f"🎬 Vidéo ≥ 70 Mo en premier \\= victoire \\(\\+3 pts\\)\n"
-        f"⚠️ Vidéo \\< 70 Mo \\= \\-3 pts \\(rattrapable \\+6 pts \\!\\)"
+        f"⚔️ @{cname} 🆚 @{tname}\n\n"
+        f"📺 *Canaux surveillés :*\n"
+        f"  • @{cname} poste dans *{ch_c}*\n"
+        f"  • @{tname} poste dans *{ch_t}*\n\n"
+        f"⏱️ *5 minutes* pour poster une vidéo \\!\n"
+        f"🎬 Vidéo ≥ 70 Mo en premier \\= *victoire \\+3 pts*\n"
+        f"⚠️ Vidéo \\< 70 Mo \\= *\\-3 pts* \\(rattrapable \\+6 pts\\)\n\n"
+        f"🏁 Le bot annoncera le vainqueur ici \\!"
     )
     try:
-        await bot.send_message(origin_chat, msg, parse_mode="MarkdownV2")
+        await bot.send_message(MAIN_GROUP_ID, msg, parse_mode="MarkdownV2")
     except Exception:
         pass
     asyncio.create_task(duel_video_timeout(bot, duel_key))
-
-
-# ─────────────────────────────────────────────
-#  TIMEOUTS
-# ─────────────────────────────────────────────
-
-async def duel_accept_timeout(bot, duel_key: str):
-    await asyncio.sleep(ACCEPT_TIMEOUT)
-    data = load_data()
-    if duel_key not in data.get("duels", {}):
-        return
-    duel = data["duels"][duel_key]
-    if duel["status"] != "pending":
-        return
-    origin_chat = duel.get("chat_id_origin", MAIN_GROUP_ID)
-    del data["duels"][duel_key]
-    save_data(data)
-    try:
-        await bot.send_message(
-            origin_chat,
-            f"⏰ @{esc(duel['challenged_name'])} n'a pas répondu au défi de @{esc(duel['challenger_name'])}\\.\n"
-            f"Duel annulé par timeout \\(5 min écoulées\\)\\.",
-            parse_mode="MarkdownV2"
-        )
-    except Exception:
-        pass
-
-
-async def duel_video_timeout(bot, duel_key: str):
-    await asyncio.sleep(DUEL_TIMEOUT)
-    data = load_data()
-    if duel_key not in data.get("duels", {}):
-        return
-    duel = data["duels"][duel_key]
-    if duel["status"] != "active":
-        return
-    origin_chat = duel.get("chat_id_origin", MAIN_GROUP_ID)
-    del data["duels"][duel_key]
-    save_data(data)
-    try:
-        await bot.send_message(
-            origin_chat,
-            f"⏰ *Timeout \\!* @{esc(duel['challenger_name'])} VS @{esc(duel['challenged_name'])}\n"
-            f"Aucun des joueurs n'a posté de vidéo valide à temps\\. Match nul \\!",
-            parse_mode="MarkdownV2"
-        )
-    except Exception:
-        pass
 
 
 # ─────────────────────────────────────────────
@@ -602,115 +860,164 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = load_data()
 
+    # Trouver un duel actif où ce canal est l'un des deux canaux de duel
     for duel_key, duel in list(data.get("duels", {}).items()):
         if duel["status"] != "active":
             continue
-        if duel.get("chat_id") != chat_id:
-            continue
-        if user.id not in [duel["challenger_id"], duel["challenged_id"]]:
+
+        # Vérifier que ce chat est l'un des deux canaux du duel
+        challenger_channel = duel.get("challenger_channel")
+        challenged_channel = duel.get("challenged_channel")
+
+        if chat_id not in [challenger_channel, challenged_channel]:
             continue
 
-        poster_name   = user.username or user.first_name
-        opponent_id   = duel["challenged_id"] if user.id == duel["challenger_id"] else duel["challenger_id"]
-        opponent_name = duel["challenged_name"] if user.id == duel["challenger_id"] else duel["challenger_name"]
-        is_big        = video_size >= VIDEO_SIZE_LIMIT
-        size_mb       = video_size / (1024 * 1024)
-        origin_chat   = duel.get("chat_id_origin", MAIN_GROUP_ID)
+        # Identifier qui est en train de poster
+        if chat_id == challenger_channel:
+            poster_id   = duel["challenger_id"]
+            poster_name = duel["challenger_name"]
+            opponent_id = duel["challenged_id"]
+            opponent_name = duel["challenged_name"]
+        else:
+            poster_id   = duel["challenged_id"]
+            poster_name = duel["challenged_name"]
+            opponent_id = duel["challenger_id"]
+            opponent_name = duel["challenger_name"]
+
+        # Vérifier que l'auteur du message correspond bien au bon joueur
+        if user.id != poster_id:
+            continue
+
+        is_big  = video_size >= VIDEO_MIN_SIZE
+        size_mb = video_size / (1024 * 1024)
 
         if not is_big:
+            # Petite vidéo → pénalité
             if "penalty_flag" not in duel:
                 duel["penalty_flag"] = {}
-            duel["penalty_flag"][str(user.id)] = True
-            get_player(data, user.id, poster_name)
-            data["players"][str(user.id)]["points"] -= 3
+            duel["penalty_flag"][str(poster_id)] = True
+            get_player(data, poster_id, poster_name)
+            data["players"][str(poster_id)]["points"] -= 3
             save_data(data)
 
-            await context.bot.send_message(
-                origin_chat,
-                f"⚠️ @{esc(poster_name)} a posté une vidéo de *{esc(f'{size_mb:.1f}')} Mo* \\(\\< 70 Mo\\) \\!\n"
-                f"💸 *\\-3 points* pour @{esc(poster_name)}\n"
-                f"⚡ Poste une vidéo ≥ 70 Mo avant @{esc(opponent_name)} pour gagner *\\+6 pts* \\!",
-                parse_mode="MarkdownV2"
-            )
+            try:
+                await context.bot.send_message(
+                    MAIN_GROUP_ID,
+                    f"⚠️ *Petite vidéo détectée \\!*\n\n"
+                    f"@{esc(poster_name)} a posté une vidéo de *{esc(f'{size_mb:.1f}')} Mo* dans *{esc(update.effective_chat.title or '')}* \\(\\< 70 Mo\\)\n\n"
+                    f"💸 *\\-3 points* pour @{esc(poster_name)}\n"
+                    f"⚡ Il peut encore poster une vidéo ≥ 70 Mo avant @{esc(opponent_name)} pour gagner *\\+6 pts* \\!",
+                    parse_mode="MarkdownV2"
+                )
+            except Exception as e:
+                logger.error(f"Erreur envoi message pénalité: {e}")
+
         else:
-            had_penalty = duel.get("penalty_flag", {}).get(str(user.id), False)
+            # Grande vidéo ≥ 70 Mo → victoire !
+            had_penalty = duel.get("penalty_flag", {}).get(str(poster_id), False)
             points_won  = 6 if had_penalty else 3
             points_lost = -1
 
-            get_player(data, user.id, poster_name)
+            get_player(data, poster_id, poster_name)
             get_player(data, opponent_id, opponent_name)
 
-            data["players"][str(user.id)]["points"]      += points_won
-            data["players"][str(user.id)]["wins"]         = data["players"][str(user.id)].get("wins", 0) + 1
-            data["players"][str(user.id)]["duels_played"] = data["players"][str(user.id)].get("duels_played", 0) + 1
-            data["players"][str(opponent_id)]["points"]  += points_lost
-            data["players"][str(opponent_id)]["losses"]   = data["players"][str(opponent_id)].get("losses", 0) + 1
+            data["players"][str(poster_id)]["points"]       += points_won
+            data["players"][str(poster_id)]["wins"]          = data["players"][str(poster_id)].get("wins", 0) + 1
+            data["players"][str(poster_id)]["duels_played"]  = data["players"][str(poster_id)].get("duels_played", 0) + 1
+            data["players"][str(opponent_id)]["points"]     += points_lost
+            data["players"][str(opponent_id)]["losses"]      = data["players"][str(opponent_id)].get("losses", 0) + 1
             data["players"][str(opponent_id)]["duels_played"] = data["players"][str(opponent_id)].get("duels_played", 0) + 1
+
+            total_winner   = data["players"][str(poster_id)]["points"]
+            total_opponent = data["players"][str(opponent_id)]["points"]
 
             data["history"].append({
                 "winner": poster_name, "loser": opponent_name,
-                "points": points_won, "date": datetime.now().isoformat()
+                "points_won": points_won, "date": datetime.now().isoformat(),
+                "video_size_mb": round(size_mb, 1)
             })
             del data["duels"][duel_key]
             save_data(data)
 
-            bonus_msg = " *\\(Bonus rattrapage \\!\\)*" if had_penalty else ""
-            total_pts = data["players"][str(user.id)]["points"]
+            bonus_txt = "\n🔥 *Bonus rattrapage \\!* \\(petite vidéo compensée\\)" if had_penalty else ""
+            duration  = int(time.time() - duel.get("started_at", time.time()))
+            dur_min   = duration // 60
+            dur_sec   = duration % 60
 
-            await context.bot.send_message(
-                origin_chat,
-                f"🏆 *DUEL TERMINÉ \\!*\n\n"
-                f"⚔️ @{esc(duel['challenger_name'])} VS @{esc(duel['challenged_name'])}\n\n"
-                f"🎉 *@{esc(poster_name)} GAGNE \\!*{bonus_msg}\n"
-                f"📹 Vidéo de *{esc(f'{size_mb:.1f}')} Mo* postée en premier \\!\n\n"
-                f"✅ @{esc(poster_name)} : *\\+{points_won} pts*\n"
-                f"❌ @{esc(opponent_name)} : *{points_lost} pt*\n\n"
-                f"📊 @{esc(poster_name)} totalise maintenant *{esc(total_pts)} pts*",
-                parse_mode="MarkdownV2"
+            victory_msg = (
+                f"🏆 *DUEL TERMINÉ — VICTOIRE \\!*\n"
+                f"{'━' * 25}\n\n"
+                f"⚔️ @{esc(duel['challenger_name'])} 🆚 @{esc(duel['challenged_name'])}\n\n"
+                f"🥇 *VAINQUEUR : @{esc(poster_name)}*{bonus_txt}\n\n"
+                f"📹 Vidéo de *{esc(f'{size_mb:.1f}')} Mo* postée dans *{esc(update.effective_chat.title or '')}*\n"
+                f"⏱️ Durée du duel : *{esc(dur_min)}min {dur_sec:02d}s*\n\n"
+                f"{'━' * 25}\n"
+                f"📊 *Mise à jour des scores :*\n"
+                f"  ✅ @{esc(poster_name)} : *\\+{points_won} pts* → Total : *{esc(total_winner)} pts*\n"
+                f"  ❌ @{esc(opponent_name)} : *{points_lost} pt* → Total : *{esc(total_opponent)} pts*\n"
+                f"{'━' * 25}\n\n"
+                f"🏅 Tape `/top` pour voir le classement mis à jour \\!"
             )
+
+            try:
+                await context.bot.send_message(MAIN_GROUP_ID, victory_msg, parse_mode="MarkdownV2")
+            except Exception as e:
+                logger.error(f"Erreur envoi victoire: {e}")
+
         break
 
 
 # ─────────────────────────────────────────────
-#  AUTRES COMMANDES
+#  TIMEOUTS
 # ─────────────────────────────────────────────
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👋 *Bienvenue sur DuelBot \\!*\n\n"
-        "⚔️ `/duel @pseudo` — Duel immédiat\n"
-        "⚔️ `/duel @pseudo 18:30` — Duel planifié à 18h30\n"
-        "⚔️ `/duel @pseudo 18:30 25/07` — Date précise\n"
-        "✅ `/accept` — Accepter un duel\n"
-        "❌ `/decline` — Refuser un duel\n"
-        "🚫 `/cancel` — Annuler son duel\n\n"
-        "📝 `/join` — S'inscrire au classement\n"
-        "🌍 `/settimezone` — Définir son fuseau horaire\n"
-        "🏆 `/top` — Classement\n"
-        "📊 `/stats` — Ses statistiques\n"
-        "📜 `/regles` — Règles du jeu\n\n"
-        "🔧 `/addchat` — \\(Admin\\) Surveiller ce canal\n"
-    )
-    await update.message.reply_text(msg, parse_mode="MarkdownV2")
-
-
-async def cmd_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+async def duel_accept_timeout(bot, duel_key: str):
+    await asyncio.sleep(ACCEPT_TIMEOUT)
     data = load_data()
-    uid  = str(user.id)
-    name = user.username or user.first_name
-
-    if uid in data["players"] and data["players"][uid].get("duels_played", 0) > 0:
-        await update.message.reply_text(f"✅ @{esc(name)}, tu es déjà inscrit \\!", parse_mode="MarkdownV2")
-    else:
-        get_player(data, user.id, name)
-        save_data(data)
-        await update.message.reply_text(
-            f"🎉 Bienvenue @{esc(name)} \\! Tu es inscrit\\.\n"
-            f"💡 Définis ton fuseau avec `/settimezone` pour les duels planifiés \\!",
+    if duel_key not in data.get("duels", {}):
+        return
+    duel = data["duels"][duel_key]
+    if duel["status"] != "pending":
+        return
+    del data["duels"][duel_key]
+    save_data(data)
+    try:
+        await bot.send_message(
+            MAIN_GROUP_ID,
+            f"⏰ @{esc(duel['challenged_name'])} n'a pas répondu au défi de @{esc(duel['challenger_name'])}\\.\n"
+            f"Duel annulé automatiquement \\(5 min écoulées\\)\\.",
             parse_mode="MarkdownV2"
         )
+    except Exception:
+        pass
 
+
+async def duel_video_timeout(bot, duel_key: str):
+    await asyncio.sleep(DUEL_TIMEOUT)
+    data = load_data()
+    if duel_key not in data.get("duels", {}):
+        return
+    duel = data["duels"][duel_key]
+    if duel["status"] != "active":
+        return
+    del data["duels"][duel_key]
+    save_data(data)
+    try:
+        await bot.send_message(
+            MAIN_GROUP_ID,
+            f"⏰ *Timeout \\!* Le duel est terminé sans vainqueur\\.\n\n"
+            f"⚔️ @{esc(duel['challenger_name'])} 🆚 @{esc(duel['challenged_name'])}\n\n"
+            f"Aucun des deux n'a posté de vidéo ≥ 70 Mo dans les temps\\.\n"
+            f"*Match nul — aucun point attribué\\.*",
+            parse_mode="MarkdownV2"
+        )
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────
+#  STATS & CLASSEMENT
+# ─────────────────────────────────────────────
 
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
@@ -731,13 +1038,23 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tz   = p.get("timezone")
     tz_display = TZ_STR_TO_LABEL.get(tz, tz or "Non défini")
     offset     = get_offset_str(tz) if tz else "–"
+    channel    = p.get("channel_name", "Non enregistré")
+
+    # Calculer le ratio
+    wins   = p.get("wins", 0)
+    losses = p.get("losses", 0)
+    played = p.get("duels_played", 0)
+    ratio  = f"{round(wins/played*100)}%" if played > 0 else "N/A"
 
     msg = (
-        f"📊 *Stats de @{esc(name)}*\n\n"
+        f"📊 *Stats de @{esc(name)}*\n"
+        f"{'━' * 20}\n\n"
         f"🏅 Points : *{esc(p.get('points', 0))}*\n"
-        f"⚔️ Duels joués : *{esc(p.get('duels_played', 0))}*\n"
-        f"✅ Victoires : *{esc(p.get('wins', 0))}*\n"
-        f"❌ Défaites : *{esc(p.get('losses', 0))}*\n"
+        f"⚔️ Duels joués : *{esc(played)}*\n"
+        f"✅ Victoires : *{esc(wins)}*\n"
+        f"❌ Défaites : *{esc(losses)}*\n"
+        f"📈 Taux de victoire : *{esc(ratio)}*\n\n"
+        f"📺 Canal : *{esc(channel)}*\n"
         f"🌍 Fuseau : *{esc(tz_display)}* \\({esc(offset)}\\)\n"
     )
     await update.message.reply_text(msg, parse_mode="MarkdownV2")
@@ -745,98 +1062,30 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_regles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "📜 *RÈGLES DES DUELS*\n\n"
-        "1️⃣ Lance un duel avec `/duel @pseudo \\[heure optionnelle\\]`\n"
-        "2️⃣ L'adversaire accepte avec `/accept`\n"
-        "3️⃣ Les deux joueurs doivent être dans un canal commun surveillé\n\n"
-        "🎬 *Système de points :*\n"
-        "• Vidéo ≥ 70 Mo postée en premier → *\\+3 pts* \\(victoire\\)\n"
-        "• Vidéo \\< 70 Mo → *\\-3 pts* \\(pénalité\\)\n"
-        "  → Si tu postes ensuite une ≥ 70 Mo avant l'adversaire → *\\+6 pts* \\!\n"
-        "• Perdre un duel → *\\-1 pt*\n\n"
-        "🗓️ *Duels planifiés :*\n"
-        "• `/duel @pseudo 18:30` — l'heure est dans *ton fuseau horaire*\n"
-        "• L'adversaire voit l'heure convertie dans *son propre fuseau*\n"
-        "• Rappel envoyé 5 min avant le début\n"
-        "• Configure ton fuseau avec `/settimezone` \\!\n\n"
+        "📜 *RÈGLES DES DUELS*\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "1️⃣ Chaque joueur enregistre *son propre canal* avec `/mychannel`\n"
+        "2️⃣ Lance un duel avec `/duel @pseudo` depuis le groupe principal\n"
+        "3️⃣ L'adversaire accepte avec `/accept`\n"
+        "4️⃣ Chacun poste une vidéo dans *son propre canal*\n"
+        "5️⃣ Le bot détecte et annonce le vainqueur dans ce groupe \\!\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🎬 *Système de points :*\n\n"
+        "• 1ère vidéo ≥ 70 Mo → *\\+3 pts* \\(victoire\\) / adversaire *\\-1 pt*\n"
+        "• Vidéo \\< 70 Mo → *\\-3 pts* \\(pénalité immédiate\\)\n"
+        "  ↳ Si tu postes ensuite une ≥ 70 Mo avant l'adversaire → *\\+6 pts* \\!\n"
+        "• Timeout sans vidéo valide → *match nul, 0 pt*\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🗓️ *Duels planifiés :*\n\n"
+        "• `/duel @pseudo 20:00` — l'heure est dans *ton fuseau*\n"
+        "• L'adversaire voit l'heure dans *son fuseau*\n"
+        "• Rappel automatique 5 min avant\n"
+        "• Configure ton fuseau avec `/settimezone`\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
         "⏱️ Délai pour poster après le début : *5 minutes*\n"
+        "⏱️ Délai pour accepter un défi : *5 minutes*\n"
     )
     await update.message.reply_text(msg, parse_mode="MarkdownV2")
-
-
-async def cmd_decline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    data = load_data()
-    for key, duel in list(data.get("duels", {}).items()):
-        if duel["challenged_id"] == user.id and duel["status"] == "pending":
-            name = duel["challenger_name"]
-            del data["duels"][key]
-            save_data(data)
-            await update.message.reply_text(
-                f"❌ @{esc(user.username or user.first_name)} a refusé le duel de @{esc(name)}\\.",
-                parse_mode="MarkdownV2"
-            )
-            return
-    await update.message.reply_text("❌ Tu n'as aucun duel en attente à refuser.")
-
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    data = load_data()
-    for key, duel in list(data.get("duels", {}).items()):
-        if user.id in [duel["challenger_id"], duel["challenged_id"]]:
-            del data["duels"][key]
-            save_data(data)
-            await update.message.reply_text(
-                f"🚫 Duel annulé par @{esc(user.username or user.first_name)}\\.",
-                parse_mode="MarkdownV2"
-            )
-            return
-    await update.message.reply_text("❌ Tu n'as aucun duel actif à annuler.")
-
-
-async def cmd_addchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    data = load_data()
-    if "monitored_chats" not in data:
-        data["monitored_chats"] = []
-    if chat.id not in data["monitored_chats"]:
-        data["monitored_chats"].append(chat.id)
-        save_data(data)
-        chat_name = chat.title or chat.username or str(chat.id)
-        await update.message.reply_text(
-            f"✅ *{esc(chat_name)}* ajouté à la surveillance des duels \\!",
-            parse_mode="MarkdownV2"
-        )
-    else:
-        await update.message.reply_text("ℹ️ Ce chat est déjà surveillé.")
-
-
-async def cmd_removechat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    data = load_data()
-    if "monitored_chats" in data and chat.id in data["monitored_chats"]:
-        data["monitored_chats"].remove(chat.id)
-        save_data(data)
-        await update.message.reply_text("✅ Chat retiré de la surveillance.")
-    else:
-        await update.message.reply_text("ℹ️ Ce chat n'était pas surveillé.")
-
-
-async def cmd_listchats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data  = load_data()
-    chats = data.get("monitored_chats", [])
-    if not chats:
-        await update.message.reply_text("ℹ️ Aucun chat surveillé\\. Utilise `/addchat`\\.", parse_mode="MarkdownV2")
-        return
-    lines = [f"🔍 *Chats surveillés \\({len(chats)}\\) :*"]
-    for cid in chats:
-        try:
-            c = await context.bot.get_chat(cid)
-            lines.append(f"• {esc(c.title or c.username)} \\(`{cid}`\\)")
-        except Exception:
-            lines.append(f"• `{cid}` \\(introuvable\\)")
-    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
 
 
 async def cmd_resetpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -844,10 +1093,10 @@ async def cmd_resetpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         member = await context.bot.get_chat_member(MAIN_GROUP_ID, user.id)
         if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-            await update.message.reply_text("❌ Commande réservée aux admins.")
+            await update.message.reply_text("❌ Commande réservée aux admins\\.", parse_mode="MarkdownV2")
             return
     except Exception:
-        await update.message.reply_text("❌ Impossible de vérifier tes droits.")
+        await update.message.reply_text("❌ Impossible de vérifier tes droits\\.", parse_mode="MarkdownV2")
         return
     if not context.args:
         await update.message.reply_text("Usage: `/resetpoints @pseudo`", parse_mode="MarkdownV2")
@@ -870,31 +1119,33 @@ async def cmd_resetpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("help",        cmd_start))
-    app.add_handler(CommandHandler("join",        cmd_join))
-    app.add_handler(CommandHandler("top",         cmd_top))
-    app.add_handler(CommandHandler("classement",  cmd_top))
-    app.add_handler(CommandHandler("stats",       cmd_stats))
-    app.add_handler(CommandHandler("regles",      cmd_regles))
-    app.add_handler(CommandHandler("duel",        cmd_duel))
-    app.add_handler(CommandHandler("accept",      cmd_accept))
-    app.add_handler(CommandHandler("decline",     cmd_decline))
-    app.add_handler(CommandHandler("cancel",      cmd_cancel))
-    app.add_handler(CommandHandler("settimezone", cmd_settimezone))
-    app.add_handler(CommandHandler("addchat",     cmd_addchat))
-    app.add_handler(CommandHandler("removechat",  cmd_removechat))
-    app.add_handler(CommandHandler("listchats",   cmd_listchats))
-    app.add_handler(CommandHandler("resetpoints", cmd_resetpoints))
+    app.add_handler(CommandHandler("start",        cmd_start))
+    app.add_handler(CommandHandler("help",         cmd_start))
+    app.add_handler(CommandHandler("join",         cmd_join))
+    app.add_handler(CommandHandler("mychannel",    cmd_mychannel))
+    app.add_handler(CommandHandler("addchannel",   cmd_addchannel))
+    app.add_handler(CommandHandler("channels",     cmd_channels))
+    app.add_handler(CommandHandler("settimezone",  cmd_settimezone))
+    app.add_handler(CommandHandler("duel",         cmd_duel))
+    app.add_handler(CommandHandler("accept",       cmd_accept))
+    app.add_handler(CommandHandler("decline",      cmd_decline))
+    app.add_handler(CommandHandler("cancel",       cmd_cancel))
+    app.add_handler(CommandHandler("top",          cmd_top))
+    app.add_handler(CommandHandler("classement",   cmd_top))
+    app.add_handler(CommandHandler("stats",        cmd_stats))
+    app.add_handler(CommandHandler("mystats",      cmd_stats))
+    app.add_handler(CommandHandler("regles",       cmd_regles))
+    app.add_handler(CommandHandler("resetpoints",  cmd_resetpoints))
 
     app.add_handler(CallbackQueryHandler(callback_settz, pattern=r"^settz:"))
 
+    # Intercepte les vidéos dans TOUS les chats (canaux inclus)
     app.add_handler(MessageHandler(
         filters.VIDEO | filters.Document.MimeType("video/mp4"),
         handle_video
     ))
 
-    logger.info("🤖 DuelBot V3 démarré !")
+    logger.info("🤖 DuelBot V4 démarré !")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
