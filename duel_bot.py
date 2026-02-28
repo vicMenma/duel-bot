@@ -61,6 +61,11 @@ def esc(text: str) -> str:
     return re.sub(f'([{re.escape(special)}])', r'\\\1', str(text))
 
 
+def h(text: str) -> str:
+    """Échappe pour HTML Telegram."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 # ─────────────────────────────────────────────
 #  FUSEAUX HORAIRES
 # ─────────────────────────────────────────────
@@ -950,8 +955,16 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"⚡ Il peut encore poster une vidéo ≥ 70 Mo avant @{h(opponent_name)} pour gagner <b>+6 pts</b> !",
                     parse_mode="HTML"
                 )
+                logger.info(f"✅ Message pénalité envoyé dans {MAIN_GROUP_ID}")
             except Exception as e:
-                logger.error(f"Erreur pénalité: {e}")
+                logger.error(f"Erreur pénalité HTML: {e}")
+                try:
+                    await context.bot.send_message(
+                        MAIN_GROUP_ID,
+                        f"⚠️ Petite vidéo de @{poster_name} : {size_mb:.2f} Mo (< 70 Mo)\n-3 points !"
+                    )
+                except Exception as e2:
+                    logger.error(f"Erreur pénalité texte: {e2} — MAIN_GROUP_ID={MAIN_GROUP_ID}")
 
         else:
             # ── Grande vidéo ≥ 70 Mo → VICTOIRE ──
@@ -1031,8 +1044,25 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 await context.bot.send_message(MAIN_GROUP_ID, victory_msg, parse_mode="HTML")
+                logger.info(f"✅ Message victoire envoyé dans {MAIN_GROUP_ID}")
             except Exception as e:
-                logger.error(f"Erreur victoire: {e}")
+                logger.error(f"Erreur victoire HTML: {e}")
+                # Fallback: texte brut sans formatage
+                try:
+                    plain = (
+                        f"🏆 DUEL TERMINÉ — VICTOIRE !\n\n"
+                        f"⚔️ {duel['challenger_name']} vs {duel['challenged_name']}\n\n"
+                        f"🥇 VAINQUEUR : @{poster_name}\n"
+                        f"📦 Taille vidéo : {size_mb:.2f} Mo\n"
+                        f"🕐 Heure : {post_time_str}\n"
+                        f"⏱️ Durée : {elapsed_min}min {elapsed_sec:02d}s\n\n"
+                        f"✅ @{poster_name} : +{points_won} pts (Total: {total_winner} pts)\n"
+                        f"❌ @{opponent_name} : {points_lost} pt (Total: {total_opponent} pts)"
+                    )
+                    await context.bot.send_message(MAIN_GROUP_ID, plain)
+                    logger.info("✅ Message victoire envoyé en texte brut")
+                except Exception as e2:
+                    logger.error(f"Erreur victoire texte brut: {e2} — MAIN_GROUP_ID={MAIN_GROUP_ID}")
 
         break
 
@@ -1380,6 +1410,22 @@ def main():
     ))
 
     logger.info("🤖 DuelBot V4 démarré !")
+    logger.info(f"📢 Groupe main configuré : {MAIN_GROUP_ID}")
+
+    # Vérifier que le bot peut envoyer dans le groupe main au démarrage
+    async def post_start_message(app):
+        try:
+            await app.bot.send_message(
+                MAIN_GROUP_ID,
+                "🤖 DuelBot démarré et opérationnel ! Tapez /start pour commencer."
+            )
+            logger.info("✅ Message de démarrage envoyé dans le groupe main")
+        except Exception as e:
+            logger.error(f"❌ Impossible d'envoyer dans le groupe main ({MAIN_GROUP_ID}): {e}")
+            logger.error("Vérifiez que le bot est admin dans le groupe main !")
+
+    app.post_init = post_start_message
+
     app.run_polling(
         allowed_updates=["message", "channel_post", "callback_query", "edited_channel_post"]
     )
