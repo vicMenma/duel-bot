@@ -891,8 +891,23 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         size_mb    = video_size / (1024 * 1024)
         chat_title = msg.chat.title or str(chat_id)
 
+        # Heure exacte de publication (à la seconde)
+        now_ts       = time.time()
+        now_dt       = datetime.now()
+        post_time_str = now_dt.strftime("%d/%m/%Y à %H:%M:%S")
+
+        # Enregistrer le timestamp de cette vidéo dans le duel
+        if "video_timestamps" not in duel:
+            duel["video_timestamps"] = {}
+        duel["video_timestamps"][str(poster_id)] = {
+            "ts":      now_ts,
+            "size_mb": round(size_mb, 2),
+            "big":     is_big,
+            "channel": chat_title
+        }
+
         if not is_big:
-            # Petite vidéo → pénalité
+            # ── Petite vidéo → pénalité ──
             if "penalty_flag" not in duel:
                 duel["penalty_flag"] = {}
             duel["penalty_flag"][str(poster_id)] = True
@@ -904,65 +919,97 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     MAIN_GROUP_ID,
                     f"⚠️ *Petite vidéo détectée \\!*\n\n"
-                    f"@{esc(poster_name)} a posté une vidéo de *{esc(f'{size_mb:.1f}')} Mo* dans *{esc(chat_title)}* \\(\\< 70 Mo\\)\n\n"
+                    f"👤 @{esc(poster_name)}\n"
+                    f"📺 Canal : *{esc(chat_title)}*\n"
+                    f"📦 Taille : *{esc(f'{size_mb:.2f}')} Mo* \\(minimum requis : 70 Mo\\)\n"
+                    f"🕐 Heure : `{esc(post_time_str)}`\n\n"
                     f"💸 *\\-3 points* pour @{esc(poster_name)}\n"
                     f"⚡ Il peut encore poster une vidéo ≥ 70 Mo avant @{esc(opponent_name)} pour gagner *\\+6 pts* \\!",
                     parse_mode="MarkdownV2"
                 )
             except Exception as e:
-                logger.error(f"Erreur envoi message pénalité: {e}")
+                logger.error(f"Erreur pénalité: {e}")
 
         else:
-            # Grande vidéo ≥ 70 Mo → victoire !
+            # ── Grande vidéo ≥ 70 Mo → VICTOIRE ──
             had_penalty = duel.get("penalty_flag", {}).get(str(poster_id), False)
             points_won  = 6 if had_penalty else 3
             points_lost = -1
 
+            # Calcul du chrono depuis le début du duel
+            duel_start   = duel.get("started_at", now_ts)
+            elapsed      = int(now_ts - duel_start)
+            elapsed_min  = elapsed // 60
+            elapsed_sec  = elapsed % 60
+
+            # Infos sur la vidéo du perdant si elle existe
+            loser_video  = duel.get("video_timestamps", {}).get(str(opponent_id))
+            loser_info   = ""
+            if loser_video:
+                loser_dt  = datetime.fromtimestamp(loser_video["ts"])
+                loser_str = loser_dt.strftime("%d/%m/%Y à %H:%M:%S")
+                gap       = int(now_ts - loser_video["ts"])
+                gap_min   = gap // 60
+                gap_sec   = gap % 60
+                loser_size_str = f"{loser_video['size_mb']:.2f}"
+                loser_info = (
+                    f"\n\n📋 *Vidéo de @{esc(opponent_name)} :*\n"
+                    f"  🕐 Heure : `{esc(loser_str)}`\n"
+                    f"  📦 Taille : *{esc(loser_size_str)} Mo*\n"
+                    f"  ⏳ Retard : *{esc(gap_min)}min {gap_sec:02d}s* après le vainqueur"
+                )
+
             get_player(data, poster_id, poster_name)
             get_player(data, opponent_id, opponent_name)
 
-            data["players"][str(poster_id)]["points"]       += points_won
-            data["players"][str(poster_id)]["wins"]          = data["players"][str(poster_id)].get("wins", 0) + 1
-            data["players"][str(poster_id)]["duels_played"]  = data["players"][str(poster_id)].get("duels_played", 0) + 1
-            data["players"][str(opponent_id)]["points"]     += points_lost
-            data["players"][str(opponent_id)]["losses"]      = data["players"][str(opponent_id)].get("losses", 0) + 1
-            data["players"][str(opponent_id)]["duels_played"] = data["players"][str(opponent_id)].get("duels_played", 0) + 1
+            data["players"][str(poster_id)]["points"]          += points_won
+            data["players"][str(poster_id)]["wins"]             = data["players"][str(poster_id)].get("wins", 0) + 1
+            data["players"][str(poster_id)]["duels_played"]     = data["players"][str(poster_id)].get("duels_played", 0) + 1
+            data["players"][str(opponent_id)]["points"]        += points_lost
+            data["players"][str(opponent_id)]["losses"]         = data["players"][str(opponent_id)].get("losses", 0) + 1
+            data["players"][str(opponent_id)]["duels_played"]   = data["players"][str(opponent_id)].get("duels_played", 0) + 1
 
             total_winner   = data["players"][str(poster_id)]["points"]
             total_opponent = data["players"][str(opponent_id)]["points"]
 
             data["history"].append({
-                "winner": poster_name, "loser": opponent_name,
-                "points_won": points_won, "date": datetime.now().isoformat(),
-                "video_size_mb": round(size_mb, 1)
+                "winner":        poster_name,
+                "loser":         opponent_name,
+                "points_won":    points_won,
+                "date":          now_dt.isoformat(),
+                "video_size_mb": round(size_mb, 2),
+                "elapsed_sec":   elapsed
             })
             del data["duels"][duel_key]
             save_data(data)
 
-            bonus_txt = "\n🔥 *Bonus rattrapage \\!* \\(petite vidéo compensée\\)" if had_penalty else ""
-            duration  = int(time.time() - duel.get("started_at", time.time()))
-            dur_min   = duration // 60
-            dur_sec   = duration % 60
+            bonus_txt = "\n🔥 *Bonus rattrapage \\!* \\(pénalité petite vidéo compensée\\)" if had_penalty else ""
 
             victory_msg = (
                 f"🏆 *DUEL TERMINÉ — VICTOIRE \\!*\n"
-                f"{'━' * 25}\n\n"
+                f"{'━' * 28}\n\n"
                 f"⚔️ @{esc(duel['challenger_name'])} 🆚 @{esc(duel['challenged_name'])}\n\n"
                 f"🥇 *VAINQUEUR : @{esc(poster_name)}*{bonus_txt}\n\n"
-                f"📹 Vidéo de *{esc(f'{size_mb:.1f}')} Mo* postée dans *{esc(chat_title)}*\n"
-                f"⏱️ Durée du duel : *{esc(dur_min)}min {dur_sec:02d}s*\n\n"
-                f"{'━' * 25}\n"
-                f"📊 *Mise à jour des scores :*\n"
+                f"{'━' * 28}\n"
+                f"📋 *Preuve de victoire :*\n\n"
+                f"  👤 Vainqueur : @{esc(poster_name)}\n"
+                f"  📺 Canal : *{esc(chat_title)}*\n"
+                f"  📦 Taille vidéo : *{esc(f'{size_mb:.2f}')} Mo*\n"
+                f"  🕐 Heure de publication : `{esc(post_time_str)}`\n"
+                f"  ⏱️ Temps écoulé depuis le début : *{esc(elapsed_min)}min {elapsed_sec:02d}s*"
+                f"{loser_info}\n\n"
+                f"{'━' * 28}\n"
+                f"📊 *Mise à jour des scores :*\n\n"
                 f"  ✅ @{esc(poster_name)} : *\\+{points_won} pts* → Total : *{esc(total_winner)} pts*\n"
-                f"  ❌ @{esc(opponent_name)} : *{points_lost} pt* → Total : *{esc(total_opponent)} pts*\n"
-                f"{'━' * 25}\n\n"
-                f"🏅 Tape `/top` pour voir le classement mis à jour \\!"
+                f"  ❌ @{esc(opponent_name)} : *{points_lost} pt* → Total : *{esc(total_opponent)} pts*\n\n"
+                f"{'━' * 28}\n"
+                f"🏅 Tape `/top` pour voir le classement \\!"
             )
 
             try:
                 await context.bot.send_message(MAIN_GROUP_ID, victory_msg, parse_mode="MarkdownV2")
             except Exception as e:
-                logger.error(f"Erreur envoi victoire: {e}")
+                logger.error(f"Erreur victoire: {e}")
 
         break
 
