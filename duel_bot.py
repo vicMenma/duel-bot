@@ -12,8 +12,10 @@ import logging
 import os
 import re
 import time
+import threading
 from datetime import datetime, timedelta
 from typing import Optional
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import pytz
 from telegram import Update, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup
@@ -1170,7 +1172,30 @@ async def cmd_resetpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  LANCEMENT
 # ─────────────────────────────────────────────
 
+class HealthHandler(BaseHTTPRequestHandler):
+    """Serveur HTTP minimal pour garder le service actif sur Render/Koyeb."""
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"DuelBot is running!")
+    def log_message(self, format, *args):
+        pass  # Silence les logs HTTP
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"🌐 Health server démarré sur port {port}")
+    server.serve_forever()
+
+
 def main():
+    # Démarrer le serveur HTTP EN PREMIER pour passer le health check Render
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    import time as _time
+    _time.sleep(1)  # Laisser le temps au serveur de démarrer
+
     # Vérifications au démarrage
     if not BOT_TOKEN:
         logger.critical("❌ BOT_TOKEN manquant ! Ajoute la variable d'environnement BOT_TOKEN sur Koyeb.")
@@ -1270,7 +1295,30 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  LANCEMENT
 # ─────────────────────────────────────────────
 
+class HealthHandler(BaseHTTPRequestHandler):
+    """Serveur HTTP minimal pour garder le service actif sur Render/Koyeb."""
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"DuelBot is running!")
+    def log_message(self, format, *args):
+        pass  # Silence les logs HTTP
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"🌐 Health server démarré sur port {port}")
+    server.serve_forever()
+
+
 def main():
+    # Démarrer le serveur HTTP EN PREMIER pour passer le health check Render
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    import time as _time
+    _time.sleep(1)  # Laisser le temps au serveur de démarrer
+
     # Vérifications au démarrage
     if not BOT_TOKEN:
         logger.critical("❌ BOT_TOKEN manquant ! Ajoute la variable d'environnement BOT_TOKEN sur Koyeb.")
