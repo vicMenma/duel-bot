@@ -218,6 +218,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/decline` — Refuser un duel\n"
         "`/cancel` — Annuler son duel en cours\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🏆 *MODE RANK*\n"
+        "`/rank` — Créer ou rejoindre une session rank \(jusqu'à 16 joueurs\)\n"
+        "`/startrank` — Démarrer la session rank\n"
+        "`/rankstatus` — Voir le classement en temps réel\n"
+        "`/cancelrank` — Annuler la session rank\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
         "📊 *STATS*\n"
         "`/top` — Classement général\n"
         "`/stats` — Ses statistiques\n"
@@ -884,6 +890,18 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"📹 Vidéo reçue — chat_id={chat_id}, size={video_size}, update_type={'channel_post' if update.channel_post else 'message'}")
 
+    import time as _t
+    post_ts = _t.time()
+
+    # Vérifier d'abord si ce canal est dans un rank actif
+    data = load_data()
+    for rid, r in data.get("ranks", {}).items():
+        if r["status"] == "active":
+            for rp in r["players"]:
+                if rp["channel_id"] == chat_id:
+                    await handle_rank_video(context.bot, chat_id, video_size, post_ts)
+                    return
+
     data = load_data()
 
     # Log tous les duels actifs pour comparaison
@@ -1233,127 +1251,392 @@ def run_health_server():
     server.serve_forever()
 
 
-def main():
-    # Démarrer le serveur HTTP EN PREMIER pour passer le health check Render
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
-    import time as _time
-    _time.sleep(1)  # Laisser le temps au serveur de démarrer
+# ─────────────────────────────────────────────
+#  MODE RANK — jusqu'à 16 joueurs simultanés
+#  Points: 1er=6, 2e=4, 3e=3, 4e=2, reste=0
+# ─────────────────────────────────────────────
 
-    # Vérifications au démarrage
-    if not BOT_TOKEN:
-        logger.critical("❌ BOT_TOKEN manquant ! Ajoute la variable d'environnement BOT_TOKEN sur Koyeb.")
-        exit(1)
-    if MAIN_GROUP_ID == 0:
-        logger.critical("❌ MAIN_GROUP_ID manquant ! Ajoute la variable d'environnement MAIN_GROUP_ID sur Koyeb.")
-        exit(1)
+RANK_POINTS    = {1: 6, 2: 4, 3: 3, 4: 2}
+RANK_MAX       = 16
+RANK_TIMEOUT   = 600   # 10 min pour poster après le début
 
-    logger.info(f"✅ BOT_TOKEN détecté")
-    logger.info(f"✅ MAIN_GROUP_ID = {MAIN_GROUP_ID}")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+async def cmd_rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Créer ou rejoindre une session rank."""
+    if update.effective_chat.id != MAIN_GROUP_ID:
+        await update.message.reply_text("❌ Commande réservée au groupe principal.")
+        return
 
-    app.add_handler(CommandHandler("start",        cmd_start))
-    app.add_handler(CommandHandler("help",         cmd_start))
-    app.add_handler(CommandHandler("join",         cmd_join))
-    app.add_handler(CommandHandler("mychannel",    cmd_mychannel))
-    app.add_handler(CommandHandler("addchannel",   cmd_addchannel))
-    app.add_handler(CommandHandler("channels",     cmd_channels))
-    app.add_handler(CommandHandler("settimezone",  cmd_settimezone))
-    app.add_handler(CommandHandler("duel",         cmd_duel))
-    app.add_handler(CommandHandler("accept",       cmd_accept))
-    app.add_handler(CommandHandler("decline",      cmd_decline))
-    app.add_handler(CommandHandler("cancel",       cmd_cancel))
-    app.add_handler(CommandHandler("top",          cmd_top))
-    app.add_handler(CommandHandler("classement",   cmd_top))
-    app.add_handler(CommandHandler("stats",        cmd_stats))
-    app.add_handler(CommandHandler("mystats",      cmd_stats))
-    app.add_handler(CommandHandler("regles",       cmd_regles))
-    app.add_handler(CommandHandler("resetpoints",  cmd_resetpoints))
+    user = update.effective_user
+    data = load_data()
+    p    = get_player(data, user.id, user.username or user.first_name)
 
-    app.add_handler(CallbackQueryHandler(callback_settz, pattern=r"^settz:"))
+    if not p.get("channel_id"):
+        await update.message.reply_text(
+            "❌ Tu n'as pas encore enregistré ton canal.\nUtilise /mychannel d'abord !"
+        )
+        return
 
-    # Intercepte les vidéos dans les CANAUX (channel_post) ET les groupes (message)
-    app.add_handler(MessageHandler(
-        filters.VIDEO | filters.Document.MimeType("video/mp4"),
-        handle_video
-    ))
-    # Handler spécifique pour les posts de canaux
-    app.add_handler(MessageHandler(
-        filters.UpdateType.CHANNEL_POSTS & (filters.VIDEO | filters.Document.MimeType("video/mp4")),
-        handle_video
-    ))
+    if "ranks" not in data:
+        data["ranks"] = {}
 
-async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche l'ID du chat actuel et les duels actifs — pour déboguer."""
-    chat   = update.effective_chat
-    data   = load_data()
+    # Chercher une session rank ouverte
+    open_rank = None
+    for rid, r in data["ranks"].items():
+        if r["status"] == "open":
+            open_rank = (rid, r)
+            break
 
-    # Infos du chat
-    lines = [
-        f"🔍 *DEBUG INFO*\n",
-        f"📍 Ce chat : `{esc(str(chat.id))}`",
-        f"📝 Nom : {esc(chat.title or chat.username or 'N/A')}",
-        f"📋 Type : {esc(chat.type)}\n",
-    ]
+    uid = str(user.id)
+    name = user.username or user.first_name
 
-    # Canaux enregistrés
-    channels = data.get("registered_channels", {})
-    lines.append(f"📺 *Canaux enregistrés \\({len(channels)}\\) :*")
-    for cid, owner_id in channels.items():
-        owner = data["players"].get(str(owner_id), {}).get("username", "?") if owner_id else "?"
-        lines.append(f"  • `{esc(cid)}` → @{esc(owner)}")
+    if open_rank:
+        rid, r = open_rank
+        # Vérifier si déjà inscrit
+        if uid in [str(x["id"]) for x in r["players"]]:
+            await update.message.reply_text("⚠️ Tu es déjà inscrit dans la session rank en cours !")
+            return
 
-    # Duels actifs
-    duels = data.get("duels", {})
-    active = [(k, d) for k, d in duels.items() if d["status"] in ["active", "pending", "scheduled"]]
-    lines.append(f"\n⚔️ *Duels en cours \\({len(active)}\\) :*")
-    for k, d in active:
-        lines.append(
-            f"  • @{esc(d['challenger_name'])} vs @{esc(d['challenged_name'])}\n"
-            f"    Status: `{esc(d['status'])}`\n"
-            f"    Canal A: `{esc(str(d.get('challenger_channel', 'N/A')))}`\n"
-            f"    Canal B: `{esc(str(d.get('challenged_channel', 'N/A')))}`"
+        if len(r["players"]) >= RANK_MAX:
+            await update.message.reply_text(f"❌ La session rank est pleine ({RANK_MAX} joueurs max) !")
+            return
+
+        r["players"].append({
+            "id":          user.id,
+            "name":        name,
+            "channel_id":  p["channel_id"],
+            "channel_name": p.get("channel_name", "?"),
+            "posted":      False,
+            "post_ts":     None,
+            "size_mb":     None
+        })
+        save_data(data)
+
+        count = len(r["players"])
+        names = ", ".join([f"@{x['name']}" for x in r["players"]])
+        await update.message.reply_text(
+            f"✅ <b>@{h(name)} a rejoint le Rank !</b>\n\n"
+            f"👥 Joueurs inscrits ({count}/{RANK_MAX}) :\n{h(names)}\n\n"
+            f"En attente... L'admin démarre avec /startrank",
+            parse_mode="HTML"
+        )
+    else:
+        # Créer une nouvelle session
+        import time as _t
+        rid = f"rank_{int(_t.time())}"
+        data["ranks"][rid] = {
+            "status":     "open",
+            "created_at": _t.time(),
+            "created_by": user.id,
+            "players": [{
+                "id":           user.id,
+                "name":         name,
+                "channel_id":   p["channel_id"],
+                "channel_name": p.get("channel_name", "?"),
+                "posted":       False,
+                "post_ts":      None,
+                "size_mb":      None
+            }]
+        }
+        save_data(data)
+        await update.message.reply_text(
+            f"🏆 <b>SESSION RANK CRÉÉE !</b>\n\n"
+            f"👤 @{h(name)} a ouvert la session.\n\n"
+            f"📋 <b>Règles :</b>\n"
+            f"• Jusqu'à {RANK_MAX} joueurs\n"
+            f"• Chaque joueur poste dans <b>son propre canal</b>\n"
+            f"• Classement par ordre de publication\n"
+            f"• 🥇 1er = <b>+6 pts</b> | 🥈 2e = <b>+4 pts</b> | 🥉 3e = <b>+3 pts</b> | 4e = <b>+2 pts</b>\n"
+            f"• Les autres = <b>0 pt</b>\n\n"
+            f"Les autres joueurs rejoignent avec /rank\n"
+            f"L'admin démarre avec /startrank quand tout le monde est prêt !",
+            parse_mode="HTML"
         )
 
-    if not active:
-        lines.append("  Aucun duel actif")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
-
-
-async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Répond avec l'ID du chat — à utiliser depuis n'importe quel canal."""
-    msg  = update.message or update.channel_post
-    if not msg:
+async def cmd_startrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin démarre la session rank."""
+    if update.effective_chat.id != MAIN_GROUP_ID:
         return
-    chat = msg.chat
-    await context.bot.send_message(
-        MAIN_GROUP_ID,
-        f"📍 ID du canal *{esc(chat.title or chat.username or 'N/A')}* : `{esc(str(chat.id))}`",
-        parse_mode="MarkdownV2"
+
+    user = update.effective_user
+    data = load_data()
+
+    # Vérifier admin
+    try:
+        member = await context.bot.get_chat_member(MAIN_GROUP_ID, user.id)
+        is_admin = member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+    except Exception:
+        is_admin = False
+
+    # Chercher session ouverte
+    open_rank = None
+    for rid, r in data.get("ranks", {}).items():
+        if r["status"] == "open":
+            open_rank = (rid, r)
+            break
+
+    if not open_rank:
+        await update.message.reply_text("❌ Aucune session rank en attente.")
+        return
+
+    rid, r = open_rank
+
+    # Seul le créateur ou un admin peut démarrer
+    if r["created_by"] != user.id and not is_admin:
+        await update.message.reply_text("❌ Seul le créateur de la session ou un admin peut la démarrer.")
+        return
+
+    if len(r["players"]) < 2:
+        await update.message.reply_text("❌ Il faut au moins 2 joueurs pour démarrer !")
+        return
+
+    import time as _t
+    r["status"]     = "active"
+    r["started_at"] = _t.time()
+    save_data(data)
+
+    players_list = "\n".join([
+        f"  {i+1}. @{p['name']} → {p['channel_name']}"
+        for i, p in enumerate(r["players"])
+    ])
+
+    msg = (
+        f"🏆 <b>RANK COMMENCÉ !</b>\n\n"
+        f"👥 <b>{len(r['players'])} joueurs :</b>\n{h(players_list)}\n\n"
+        f"⏱️ Vous avez <b>10 minutes</b> pour poster une vidéo ≥ 70 Mo dans votre canal !\n\n"
+        f"🥇 1er = +6 pts\n"
+        f"🥈 2e = +4 pts\n"
+        f"🥉 3e = +3 pts\n"
+        f"  4e = +2 pts\n"
+        f"  Reste = 0 pt\n\n"
+        f"🎬 GO GO GO !"
     )
+    await update.message.reply_text(msg, parse_mode="HTML")
+    asyncio.create_task(rank_timeout(context.bot, rid))
 
 
-# ─────────────────────────────────────────────
-#  LANCEMENT
-# ─────────────────────────────────────────────
+async def cmd_cancelrank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Annuler la session rank en cours."""
+    user = update.effective_user
+    data = load_data()
 
-class HealthHandler(BaseHTTPRequestHandler):
-    """Serveur HTTP minimal pour garder le service actif sur Render/Koyeb."""
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"DuelBot is running!")
-    def log_message(self, format, *args):
-        pass  # Silence les logs HTTP
+    for rid, r in list(data.get("ranks", {}).items()):
+        if r["status"] in ["open", "active"]:
+            if r["created_by"] == user.id:
+                r["status"] = "cancelled"
+                save_data(data)
+                await update.message.reply_text("🚫 Session rank annulée.")
+                return
+
+    # Vérifier si admin
+    try:
+        member = await context.bot.get_chat_member(MAIN_GROUP_ID, user.id)
+        if member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
+            for rid, r in list(data.get("ranks", {}).items()):
+                if r["status"] in ["open", "active"]:
+                    r["status"] = "cancelled"
+                    save_data(data)
+                    await update.message.reply_text("🚫 Session rank annulée par un admin.")
+                    return
+    except Exception:
+        pass
+
+    await update.message.reply_text("❌ Aucune session rank à annuler.")
 
 
-def run_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info(f"🌐 Health server démarré sur port {port}")
-    server.serve_forever()
+async def cmd_rankstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Voir le statut de la session rank en cours."""
+    data = load_data()
+
+    for rid, r in data.get("ranks", {}).items():
+        if r["status"] in ["open", "active"]:
+            posted   = [p for p in r["players"] if p["posted"]]
+            waiting  = [p for p in r["players"] if not p["posted"]]
+            status   = "🟢 En cours" if r["status"] == "active" else "🟡 En attente de démarrage"
+
+            lines = [f"🏆 <b>SESSION RANK — {status}</b>\n"]
+            lines.append(f"👥 {len(r['players'])} joueurs inscrits\n")
+
+            if posted:
+                lines.append(f"✅ <b>Ont déjà posté ({len(posted)}) :</b>")
+                for i, p in enumerate(sorted(posted, key=lambda x: x["post_ts"])):
+                    pts   = RANK_POINTS.get(i + 1, 0)
+                    lines.append(f"  {i+1}. @{p['name']} — {p['size_mb']:.1f} Mo (+{pts} pts)")
+
+            if waiting:
+                lines.append(f"\n⏳ <b>En attente ({len(waiting)}) :</b>")
+                for p in waiting:
+                    lines.append(f"  • @{p['name']} → {p['channel_name']}")
+
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            return
+
+    await update.message.reply_text("ℹ️ Aucune session rank en cours.\nUtilise /rank pour en créer une !")
+
+
+async def handle_rank_video(bot, chat_id: int, video_size: int, post_ts: float):
+    """Appelé quand une vidéo est détectée dans un canal pendant un rank actif."""
+    data     = load_data()
+    size_mb  = video_size / (1024 * 1024)
+    is_valid = video_size >= VIDEO_MIN_SIZE
+
+    for rid, r in data.get("ranks", {}).items():
+        if r["status"] != "active":
+            continue
+
+        # Chercher le joueur dont c'est le canal
+        player_idx = None
+        for i, p in enumerate(r["players"]):
+            if p["channel_id"] == chat_id:
+                player_idx = i
+                break
+
+        if player_idx is None:
+            continue
+
+        player = r["players"][player_idx]
+
+        if player["posted"]:
+            continue  # Déjà posté, ignorer
+
+        if not is_valid:
+            # Petite vidéo dans un rank — juste notifier, pas de pénalité en rank
+            try:
+                await bot.send_message(
+                    MAIN_GROUP_ID,
+                    f"⚠️ @{h(player['name'])} a posté une vidéo de {size_mb:.2f} Mo dans le rank "
+                    f"(minimum 70 Mo). Ça ne compte pas !",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Erreur notif rank petite vidéo: {e}")
+            return
+
+        # Vidéo valide — enregistrer
+        player["posted"]  = True
+        player["post_ts"] = post_ts
+        player["size_mb"] = round(size_mb, 2)
+
+        # Compter combien ont posté
+        posted_players = sorted(
+            [p for p in r["players"] if p["posted"]],
+            key=lambda x: x["post_ts"]
+        )
+        rank_pos  = len(posted_players)
+        pts_won   = RANK_POINTS.get(rank_pos, 0)
+        remaining = len([p for p in r["players"] if not p["posted"]])
+
+        post_dt  = datetime.fromtimestamp(post_ts)
+        post_str = post_dt.strftime("%d/%m/%Y à %H:%M:%S")
+
+        medals = {1: "🥇", 2: "🥈", 3: "🥉", 4: "4️⃣"}
+        medal  = medals.get(rank_pos, f"{rank_pos}.")
+
+        save_data(data)
+
+        try:
+            await bot.send_message(
+                MAIN_GROUP_ID,
+                f"{medal} <b>@{h(player['name'])} — Position #{rank_pos} !</b>\n\n"
+                f"📦 Taille : <b>{size_mb:.2f} Mo</b>\n"
+                f"🕐 Heure : <code>{h(post_str)}</code>\n"
+                f"🏅 Points gagnés : <b>+{pts_won} pts</b>\n\n"
+                f"⏳ En attente de {remaining} joueur(s)...",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Erreur notif rank position: {e}")
+
+        # Si tous ont posté → clore le rank
+        if remaining == 0:
+            await close_rank(bot, rid, data, reason="complete")
+        return
+
+
+async def close_rank(bot, rid: str, data: dict, reason: str = "complete"):
+    """Clore la session rank et distribuer les points."""
+    r = data["ranks"][rid]
+    r["status"] = "finished"
+
+    posted  = sorted([p for p in r["players"] if p["posted"]], key=lambda x: x["post_ts"])
+    no_post = [p for p in r["players"] if not p["posted"]]
+
+    # Distribuer les points
+    for i, p in enumerate(posted):
+        pts = RANK_POINTS.get(i + 1, 0)
+        uid = str(p["id"])
+        if uid in data["players"]:
+            data["players"][uid]["points"]       += pts
+            data["players"][uid]["duels_played"]  = data["players"][uid].get("duels_played", 0) + 1
+            if pts > 0:
+                data["players"][uid]["wins"] = data["players"][uid].get("wins", 0) + 1
+
+    save_data(data)
+
+    # Construire le message de résultats
+    medals  = {1: "🥇", 2: "🥈", 3: "🥉", 4: "4️⃣"}
+    lines   = []
+
+    if reason == "timeout":
+        lines.append("⏰ <b>RANK TERMINÉ — Temps écoulé !</b>\n")
+    else:
+        lines.append("🏆 <b>RANK TERMINÉ — Résultats finaux !</b>\n")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    lines.append("📊 <b>Classement :</b>\n")
+
+    for i, p in enumerate(posted):
+        pts      = RANK_POINTS.get(i + 1, 0)
+        medal    = medals.get(i + 1, f"  {i+1}.")
+        post_dt  = datetime.fromtimestamp(p["post_ts"])
+        post_str = post_dt.strftime("%H:%M:%S")
+        total    = data["players"].get(str(p["id"]), {}).get("points", 0)
+        lines.append(
+            f"{medal} @{h(p['name'])} — <b>+{pts} pts</b>\n"
+            f"   📦 {p['size_mb']} Mo | 🕐 {h(post_str)} | Total: {total} pts"
+        )
+
+    if no_post:
+        lines.append(f"\n❌ <b>N'ont pas posté (0 pt) :</b>")
+        for p in no_post:
+            lines.append(f"  • @{h(p['name'])}")
+
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🏅 Tape /top pour voir le classement général !")
+
+    try:
+        await bot.send_message(MAIN_GROUP_ID, "\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Erreur envoi résultats rank: {e}")
+
+
+async def rank_timeout(bot, rid: str):
+    """Timeout du rank après 10 minutes."""
+    await asyncio.sleep(RANK_TIMEOUT)
+    data = load_data()
+    if rid not in data.get("ranks", {}):
+        return
+    r = data["ranks"][rid]
+    if r["status"] != "active":
+        return
+
+    posted = [p for p in r["players"] if p["posted"]]
+    if not posted:
+        # Personne n'a posté
+        r["status"] = "finished"
+        save_data(data)
+        try:
+            await bot.send_message(
+                MAIN_GROUP_ID,
+                "⏰ <b>Rank terminé — personne n'a posté de vidéo valide !</b>\nAucun point attribué.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        return
+
+    await close_rank(bot, rid, data, reason="timeout")
 
 
 def main():
@@ -1395,6 +1678,10 @@ def main():
     app.add_handler(CommandHandler("resetpoints",  cmd_resetpoints))
     app.add_handler(CommandHandler("debug",        cmd_debug))
     app.add_handler(CommandHandler("chatid",       cmd_chatid))
+    app.add_handler(CommandHandler("rank",         cmd_rank))
+    app.add_handler(CommandHandler("startrank",    cmd_startrank))
+    app.add_handler(CommandHandler("cancelrank",   cmd_cancelrank))
+    app.add_handler(CommandHandler("rankstatus",   cmd_rankstatus))
 
     app.add_handler(CallbackQueryHandler(callback_settz, pattern=r"^settz:"))
 
