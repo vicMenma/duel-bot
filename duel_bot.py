@@ -839,15 +839,18 @@ async def scheduled_duel_start(bot, duel_key: str, scheduled_ts: float):
 
 # ─────────────────────────────────────────────
 #  GESTION DES VIDÉOS
+#  Dans un CANAL Telegram, effective_user est None
+#  car c'est le canal lui-même qui est l'auteur.
+#  On identifie le joueur par l'ID du canal.
 # ─────────────────────────────────────────────
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user:
+    # Accepter les posts de canaux ET les messages normaux
+    msg = update.channel_post or update.message
+    if not msg:
         return
 
-    msg        = update.message
-    user       = update.effective_user
-    chat_id    = update.effective_chat.id
+    chat_id    = msg.chat_id
     video_size = 0
 
     if msg.video:
@@ -858,38 +861,35 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if video_size == 0:
         return
 
+    logger.info(f"Video detected in chat {chat_id}, size={video_size}")
+
     data = load_data()
 
-    # Trouver un duel actif où ce canal est l'un des deux canaux de duel
     for duel_key, duel in list(data.get("duels", {}).items()):
         if duel["status"] != "active":
             continue
 
-        # Vérifier que ce chat est l'un des deux canaux du duel
         challenger_channel = duel.get("challenger_channel")
         challenged_channel = duel.get("challenged_channel")
 
         if chat_id not in [challenger_channel, challenged_channel]:
             continue
 
-        # Identifier qui est en train de poster
+        # Identifier le joueur par son canal (pas par l'user)
         if chat_id == challenger_channel:
-            poster_id   = duel["challenger_id"]
-            poster_name = duel["challenger_name"]
-            opponent_id = duel["challenged_id"]
+            poster_id     = duel["challenger_id"]
+            poster_name   = duel["challenger_name"]
+            opponent_id   = duel["challenged_id"]
             opponent_name = duel["challenged_name"]
         else:
-            poster_id   = duel["challenged_id"]
-            poster_name = duel["challenged_name"]
-            opponent_id = duel["challenger_id"]
+            poster_id     = duel["challenged_id"]
+            poster_name   = duel["challenged_name"]
+            opponent_id   = duel["challenger_id"]
             opponent_name = duel["challenger_name"]
 
-        # Vérifier que l'auteur du message correspond bien au bon joueur
-        if user.id != poster_id:
-            continue
-
-        is_big  = video_size >= VIDEO_MIN_SIZE
-        size_mb = video_size / (1024 * 1024)
+        is_big     = video_size >= VIDEO_MIN_SIZE
+        size_mb    = video_size / (1024 * 1024)
+        chat_title = msg.chat.title or str(chat_id)
 
         if not is_big:
             # Petite vidéo → pénalité
@@ -904,7 +904,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     MAIN_GROUP_ID,
                     f"⚠️ *Petite vidéo détectée \\!*\n\n"
-                    f"@{esc(poster_name)} a posté une vidéo de *{esc(f'{size_mb:.1f}')} Mo* dans *{esc(update.effective_chat.title or '')}* \\(\\< 70 Mo\\)\n\n"
+                    f"@{esc(poster_name)} a posté une vidéo de *{esc(f'{size_mb:.1f}')} Mo* dans *{esc(chat_title)}* \\(\\< 70 Mo\\)\n\n"
                     f"💸 *\\-3 points* pour @{esc(poster_name)}\n"
                     f"⚡ Il peut encore poster une vidéo ≥ 70 Mo avant @{esc(opponent_name)} pour gagner *\\+6 pts* \\!",
                     parse_mode="MarkdownV2"
@@ -949,7 +949,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{'━' * 25}\n\n"
                 f"⚔️ @{esc(duel['challenger_name'])} 🆚 @{esc(duel['challenged_name'])}\n\n"
                 f"🥇 *VAINQUEUR : @{esc(poster_name)}*{bonus_txt}\n\n"
-                f"📹 Vidéo de *{esc(f'{size_mb:.1f}')} Mo* postée dans *{esc(update.effective_chat.title or '')}*\n"
+                f"📹 Vidéo de *{esc(f'{size_mb:.1f}')} Mo* postée dans *{esc(chat_title)}*\n"
                 f"⏱️ Durée du duel : *{esc(dur_min)}min {dur_sec:02d}s*\n\n"
                 f"{'━' * 25}\n"
                 f"📊 *Mise à jour des scores :*\n"
@@ -1139,14 +1139,20 @@ def main():
 
     app.add_handler(CallbackQueryHandler(callback_settz, pattern=r"^settz:"))
 
-    # Intercepte les vidéos dans TOUS les chats (canaux inclus)
+    # Intercepte les vidéos dans les CANAUX (channel_post) ET les groupes (message)
     app.add_handler(MessageHandler(
         filters.VIDEO | filters.Document.MimeType("video/mp4"),
         handle_video
     ))
+    # Handler spécifique pour les posts de canaux
+    app.add_handler(MessageHandler(
+        filters.UpdateType.CHANNEL_POSTS & (filters.VIDEO | filters.Document.MimeType("video/mp4")),
+        handle_video
+    ))
 
     logger.info("🤖 DuelBot V4 démarré !")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # allowed_updates doit inclure channel_post pour recevoir les vidéos des canaux
+    app.run_polling(allowed_updates=["message", "channel_post", "callback_query", "edited_channel_post"])
 
 
 if __name__ == "__main__":
