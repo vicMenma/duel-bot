@@ -27,18 +27,32 @@ from telegram.ext import (
 # ─────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────
-BOT_TOKEN     = os.environ.get("BOT_TOKEN")
-MAIN_GROUP_ID = int(os.environ.get("MAIN_GROUP_ID", "0"))
-DATA_FILE     = "duel_data.json"
-DUEL_TIMEOUT  = 300       # 5 min pour poster après le début
-ACCEPT_TIMEOUT = 300      # 5 min pour accepter
-VIDEO_MIN_SIZE = 70 * 1024 * 1024  # 70 Mo
+BOT_TOKEN     = os.environ.get("BOT_TOKEN", "").strip()
+
+# Parser MAIN_GROUP_ID de façon robuste
+_gid_raw = os.environ.get("MAIN_GROUP_ID", "0").strip().strip('"').strip("'")
+try:
+    MAIN_GROUP_ID = int(_gid_raw)
+except ValueError:
+    MAIN_GROUP_ID = 0
+
+DATA_FILE      = "duel_data.json"
+DUEL_TIMEOUT   = 300
+ACCEPT_TIMEOUT = 300
+VIDEO_MIN_SIZE = 70 * 1024 * 1024
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Log immédiat pour voir si le bot démarre
+logger.info("=" * 50)
+logger.info("🤖 DuelBot — Démarrage en cours...")
+logger.info(f"BOT_TOKEN présent: {bool(BOT_TOKEN)}")
+logger.info(f"MAIN_GROUP_ID raw: '{_gid_raw}' → parsed: {MAIN_GROUP_ID}")
+logger.info("=" * 50)
 
 
 def esc(text: str) -> str:
@@ -1369,3 +1383,7 @@ def main():
     app.run_polling(
         allowed_updates=["message", "channel_post", "callback_query", "edited_channel_post"]
     )
+
+
+if __name__ == "__main__":
+    main()
